@@ -61,6 +61,13 @@ configure_file(
     install: true,
     install_dir: dependency('systemd').get_variable('systemdsystemunitdir'),
 )
+if get_option('use_filesystem_strategy')
+    add_project_arguments('-DUSE_FILESYSTEM_STRATEGY', language: 'cpp')
+    message('pic_controller: using FileSystemStrategy for persistence')
+else
+    message('pic_controller: using I2CStrategy for persistence')
+endif
+
 executable(
     'bmc-pairing-manager',
     ['src/bmc_pairing_manager.cpp'],
