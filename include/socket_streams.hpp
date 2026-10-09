@@ -3,9 +3,17 @@
 #include "logger.hpp"
 #include "make_awaitable.hpp"
 
+#include <openssl/err.h>
+
 #include <boost/asio.hpp>
 #include <boost/asio/spawn.hpp>
 #include <boost/asio/streambuf.hpp>
+#include <boost/system/error_code.hpp>
+
+#include <array>
+#include <format>
+#include <string>
+#include <string_view>
 
 #ifdef __linux__
 #include <netinet/tcp.h>
@@ -15,6 +23,44 @@
 using namespace std::chrono_literals;
 namespace NSNAME
 {
+// Logs a detailed SSL handshake error.
+// Boost.Asio captures only one OpenSSL error in ec.value(); the full chain is
+// in the thread-local OpenSSL error queue. We drain the queue here so every
+// pending error is logged before anything else clears it.
+inline void logSslHandshakeError(std::string_view contextMsg,
+                                 const boost::system::error_code& ec)
+{
+    LOG_ERROR("{}: {}", contextMsg, ec.message());
+
+    unsigned long err = 0;
+    bool anyQueued = false;
+    while ((err = ERR_get_error()) != 0)
+    {
+        anyQueued = true;
+        std::array<char, 256> buf{};
+        ERR_error_string_n(err, buf.data(), buf.size());
+        LOG_ERROR("  openssl: {}", buf.data());
+    }
+
+    // If the queue was already drained (consumed by asio internally), fall back
+    // to decoding ec.value() directly — it holds the last captured error long.
+    if (!anyQueued)
+    {
+        unsigned long sslErr = static_cast<unsigned long>(ec.value());
+        std::array<char, 256> buf{};
+        ERR_error_string_n(sslErr, buf.data(), buf.size());
+        LOG_ERROR("  openssl (from ec): {}", buf.data());
+    }
+}
+
+inline void logSslHandshakeError(const std::string& host,
+                                 const std::string& port,
+                                 const boost::system::error_code& ec)
+{
+    logSslHandshakeError(
+        std::format("SSL handshake failed with {}:{}", host, port), ec);
+}
+
 // Configure TCP keepalive to detect dead connections quickly.
 // Enables keepalive and, on Linux, sets aggressive probe parameters:
 //   idle time = 3s, probe interval = 2s, probe count = 2 (~7s total).

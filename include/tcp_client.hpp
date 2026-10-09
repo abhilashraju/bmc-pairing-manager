@@ -2,6 +2,8 @@
 #include "make_awaitable.hpp"
 #include "socket_streams.hpp"
 
+#include <openssl/err.h>
+
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -63,8 +65,8 @@ class TcpClient
         }
     }
 
-    net::awaitable<boost::system::error_code> connect(std::string host,
-                                                      std::string port)
+    net::awaitable<boost::system::error_code> connect(
+        std::string host, std::string port, std::string sniHost = {})
     {
         // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
         auto [ec, results] = co_await awaitable_resolve(resolver_, host, port);
@@ -89,14 +91,22 @@ class TcpClient
 
         // Configure TCP keepalive to detect dead connections quickly
         configureSocketKeepalive(stream_->lowest_layer());
+
+        // Set SNI hostname for TLS handshake (fall back to host if not given)
+        const std::string& sni = sniHost.empty() ? host : sniHost;
+        if (!SSL_set_tlsext_host_name(stream_->native_handle(), sni.c_str()))
+        {
+            LOG_WARNING("Failed to set SNI hostname for {}", sni);
+        }
+
         streamer.setTimeout(30s);
         co_await stream_->async_handshake(
             ssl::stream_base::client,
             net::redirect_error(net::use_awaitable, ec));
         if (ec)
         {
-            LOG_ERROR("Error during SSL handshake with {}:{}. Error: {}", host,
-                      port, ec.message());
+            logSslHandshakeError(host, port, ec);
+            co_return ec;
         }
         co_return ec;
     }

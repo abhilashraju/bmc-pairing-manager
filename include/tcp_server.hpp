@@ -3,6 +3,9 @@
 #include "make_awaitable.hpp"
 #include "socket_streams.hpp"
 
+#include <openssl/err.h>
+
+#include <array>
 #include <concepts>
 #include <string>
 #include <string_view>
@@ -59,7 +62,7 @@ class TcpServer
             boost::asio::redirect_error(boost::asio::use_awaitable, ec));
         if (ec)
         {
-            LOG_ERROR("Ssl handshake error {}", ec.message());
+            logSslHandshakeError("SSL server handshake error", ec);
             co_return;
         }
         if constexpr (requires { router(socket); })
