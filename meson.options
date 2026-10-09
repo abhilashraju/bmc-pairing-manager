@@ -27,3 +27,10 @@ option(
 )
 
 option('tests', type: 'feature', description: 'Build unit tests', value: 'auto')
+
+option(
+    'use_filesystem_strategy',
+    type: 'boolean',
+    description: 'Use FileSystemStrategy for persistence; default uses I2CStrategy',
+    value: false,
+)

@@ -63,10 +63,13 @@ struct PicCommand
 
     /**
      * @brief Create a PIC command with automatic checksum calculation
+     *
+     * Checksum is the bitwise NOT of the command byte:
+     *   checksum = ~cmd
      */
     static constexpr PicCommand create(uint8_t cmd)
     {
-        return PicCommand{0xFF, cmd, static_cast<uint8_t>(~(0xFF ^ cmd))};
+        return PicCommand{0xFF, cmd, static_cast<uint8_t>(~cmd)};
     }
 
     /**
@@ -389,7 +392,6 @@ class I2CStrategy
  * Define USE_FILESYSTEM_STRATEGY to use FileSystemStrategy,
  * otherwise I2CStrategy is used by default.
  */
-#define USE_FILESYSTEM_STRATEGY
 #ifdef USE_FILESYSTEM_STRATEGY
 using DefaultPersistenceStrategy = FileSystemStrategy;
 #else
