@@ -337,6 +337,12 @@ inline AwaitableResult<ReturnType> callObjectMapperMethod(
         method, args...);
 }
 
+// Canonical type for GetSubTree responses.
+// D-Bus wire type: a{sa{sas}}
+//   object-path → service-name → array of interfaces
+using SubTreeMap =
+    std::map<std::string, std::map<std::string, std::vector<std::string>>>;
+
 /**
  * @brief Query D-Bus object mapper for a subtree of objects
  *
@@ -366,6 +372,14 @@ inline AwaitableResult<SubTreeMapType> getSubTree(
 {
     return callObjectMapperMethod<SubTreeMapType>(bus, "GetSubTree", path,
                                                   depth, interfaces);
+}
+
+/// Convenience overload — deduces SubTreeMap as the return type.
+inline AwaitableResult<SubTreeMap> getSubTree(
+    sdbusplus::asio::connection& bus, const std::string& path, int depth,
+    const std::vector<std::string>& interfaces = {})
+{
+    return getSubTree<SubTreeMap>(bus, path, depth, interfaces);
 }
 
 /**
