@@ -8,7 +8,7 @@ using namespace NSNAME;
 using EVP_MD_CTX_Ptr = openssl_ptr<EVP_MD_CTX, EVP_MD_CTX_free>;
 inline EVP_MD_CTX_Ptr makeEVPMDCTXPtr(EVP_MD_CTX* ptr)
 {
-    return {ptr, EVP_MD_CTX_free};
+    return {ptr, &EVP_MD_CTX_free};
 }
 std::string getExecutableMeasurement(const std::string& exePath,
                                      const EVP_PKEYPtr& privKey)
