@@ -41,16 +41,16 @@ using X509Ptr = openssl_ptr<X509, X509_free>;
 using BIOPtr = openssl_ptr<BIO, BIO_free_all>;
 X509Ptr makeX509Ptr(X509* ptr)
 {
-    return {ptr, X509_free};
+    return {ptr, &X509_free};
 }
 using EVP_PKEYPtr = openssl_ptr<EVP_PKEY, EVP_PKEY_free>;
 EVP_PKEYPtr makeEVPPKeyPtr(EVP_PKEY* ptr)
 {
-    return {ptr, EVP_PKEY_free};
+    return {ptr, &EVP_PKEY_free};
 }
 BIOPtr makeBIOPtr(BIO* ptr)
 {
-    return {ptr, BIO_free_all};
+    return {ptr, &BIO_free_all};
 }
 
 // RAII wrapper for FILE* to prevent resource leaks
@@ -81,12 +81,8 @@ class Tpm2
     OSSL_LIB_CTX* libCtx{nullptr};
     void* tpmProviderHandle{nullptr};
 
-    Tpm2() : libCtx(OSSL_LIB_CTX_new())
+    Tpm2()
     {
-        if (libCtx == nullptr)
-        {
-            throw std::runtime_error("Failed to allocate OSSL_LIB_CTX");
-        }
         tpmInit();
     }
 
@@ -100,10 +96,11 @@ class Tpm2
         if (libCtx)
         {
             OSSL_LIB_CTX_free(libCtx);
+            libCtx = nullptr;
         }
     }
 
-    void tpmInit()
+    static void tpmInit()
     {
         // const char* libPath = "/usr/lib/aarch64-linux-gnu/engines-3/tpm2.so";
 
@@ -128,7 +125,7 @@ class Tpm2
         // }
 
         // fun(libCtx, NULL, NULL);
-        OSSL_PROVIDER* tpmProvider = OSSL_PROVIDER_load(libCtx, "tpm2");
+        OSSL_PROVIDER* tpmProvider = OSSL_PROVIDER_load(nullptr, "tpm2");
 
         if (tpmProvider)
         {
@@ -592,7 +589,7 @@ openssl_ptr<EVP_PKEY, EVP_PKEY_free> loadPrivateKey(const std::string& path,
 {
     BIO* keybio = BIO_new_file(path.data(), "r");
     if (!keybio)
-        return {nullptr, EVP_PKEY_free};
+        return {nullptr, &EVP_PKEY_free};
     EVP_PKEY* pkey{nullptr};
     if (pem)
     {
@@ -604,14 +601,14 @@ openssl_ptr<EVP_PKEY, EVP_PKEY_free> loadPrivateKey(const std::string& path,
     }
 
     BIO_free(keybio);
-    return {pkey, EVP_PKEY_free};
+    return {pkey, &EVP_PKEY_free};
 }
 openssl_ptr<X509, X509_free> loadCertificate(const std::string& path,
                                              bool pem = true)
 {
     BIO* certbio = BIO_new_file(path.data(), "r");
     if (!certbio)
-        return {nullptr, X509_free};
+        return {nullptr, &X509_free};
     X509* cert{nullptr};
     if (pem)
     {
@@ -622,15 +619,15 @@ openssl_ptr<X509, X509_free> loadCertificate(const std::string& path,
         cert = d2i_X509_bio(certbio, nullptr);
     }
     BIO_free(certbio);
-    return {cert, X509_free};
+    return {cert, &X509_free};
 }
 openssl_ptr<X509_NAME, X509_NAME_free> generateX509Name(
     const std::string& common_name)
 {
     openssl_ptr<X509_NAME, X509_NAME_free> name(X509_NAME_new(),
-                                                X509_NAME_free);
+                                                &X509_NAME_free);
     if (!name)
-        return {nullptr, X509_NAME_free};
+        return {nullptr, &X509_NAME_free};
     // NOLINTBEGIN(cppcoreguidelines-pro-type-cstyle-cast)
     X509_NAME_add_entry_by_txt(name.get(), "C", MBSTRING_ASC,
                                (const unsigned char*)"US", -1, -1, 0);
@@ -653,31 +650,31 @@ openssl_ptr<OSSL_PARAM, OSSL_PARAM_free> buildRSAParams(int bits,
                                                         unsigned long exponent)
 {
     openssl_ptr<OSSL_PARAM_BLD, OSSL_PARAM_BLD_free> param_bld(
-        OSSL_PARAM_BLD_new(), OSSL_PARAM_BLD_free);
+        OSSL_PARAM_BLD_new(), &OSSL_PARAM_BLD_free);
     if (!param_bld)
     {
-        return {nullptr, OSSL_PARAM_free};
+        return {nullptr, &OSSL_PARAM_free};
     }
 
     if (OSSL_PARAM_BLD_push_int(param_bld.get(), OSSL_PKEY_PARAM_RSA_BITS,
                                 bits) <= 0)
     {
-        return {nullptr, OSSL_PARAM_free};
+        return {nullptr, &OSSL_PARAM_free};
     }
 
-    openssl_ptr<BIGNUM, BN_free> e(BN_new(), BN_free);
+    openssl_ptr<BIGNUM, BN_free> e(BN_new(), &BN_free);
     if (!e || !BN_set_word(e.get(), exponent))
     {
-        return {nullptr, OSSL_PARAM_free};
+        return {nullptr, &OSSL_PARAM_free};
     }
 
     if (OSSL_PARAM_BLD_push_BN(param_bld.get(), OSSL_PKEY_PARAM_RSA_E,
                                e.get()) <= 0)
     {
-        return {nullptr, OSSL_PARAM_free};
+        return {nullptr, &OSSL_PARAM_free};
     }
 
-    return {OSSL_PARAM_BLD_to_param(param_bld.get()), OSSL_PARAM_free};
+    return {OSSL_PARAM_BLD_to_param(param_bld.get()), &OSSL_PARAM_free};
 }
 
 openssl_ptr<OSSL_PARAM, OSSL_PARAM_free> getCachedRSA2048Params()
@@ -690,7 +687,8 @@ openssl_ptr<OSSL_PARAM, OSSL_PARAM_free> getCachedRSA2048Params()
 openssl_ptr<EVP_PKEY, EVP_PKEY_free> generate_key_pair()
 {
     openssl_ptr<EVP_PKEY_CTX, EVP_PKEY_CTX_free> pkey_ctx(
-        EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr), EVP_PKEY_CTX_free);
+        EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr),
+        &EVP_PKEY_CTX_free);
     if (!pkey_ctx)
         return makeEVPPKeyPtr(nullptr);
 
@@ -743,7 +741,7 @@ inline openssl_ptr<X509, X509_free> create_certificate(
                   days_valid, CERT_MAX_VALIDITY_DAYS);
         return makeX509Ptr(nullptr);
     }
-    openssl_ptr<X509, X509_free> cert(X509_new(), X509_free);
+    openssl_ptr<X509, X509_free> cert(X509_new(), &X509_free);
     std::random_device rd;
     std::mt19937_64 gen(rd());
     std::uniform_int_distribution<uint64_t> dis(
@@ -806,8 +804,8 @@ inline std::pair<X509Ptr, EVP_PKEYPtr> create_ca_cert(
     {
         LOG_ERROR("Invalid days_valid: {}. Must be between 1 and {} days",
                   days_valid, CERT_MAX_VALIDITY_DAYS);
-        return std::make_pair(X509Ptr(nullptr, X509_free),
-                              EVP_PKEYPtr(nullptr, EVP_PKEY_free));
+        return std::make_pair(X509Ptr(nullptr, &X509_free),
+                              EVP_PKEYPtr(nullptr, &EVP_PKEY_free));
     }
     auto pkey = generate_key_pair();
     openssl_ptr<X509_NAME, X509_NAME_free> name = generateX509Name(common_name);
@@ -815,8 +813,8 @@ inline std::pair<X509Ptr, EVP_PKEYPtr> create_ca_cert(
     {
         LOG_ERROR("Failed to create X509 name for common name: {}",
                   common_name);
-        return std::make_pair(X509Ptr(nullptr, X509_free),
-                              EVP_PKEYPtr(nullptr, EVP_PKEY_free));
+        return std::make_pair(X509Ptr(nullptr, &X509_free),
+                              EVP_PKEYPtr(nullptr, &EVP_PKEY_free));
     }
 
     if (signkey)
@@ -843,8 +841,8 @@ inline std::pair<X509Ptr, EVP_PKEYPtr> create_leaf_cert(
     {
         LOG_ERROR("Invalid days_valid: {}. Must be between 1 and {} days",
                   days_valid, CERT_MAX_VALIDITY_DAYS);
-        return std::make_pair(X509Ptr(nullptr, X509_free),
-                              EVP_PKEYPtr(nullptr, EVP_PKEY_free));
+        return std::make_pair(X509Ptr(nullptr, &X509_free),
+                              EVP_PKEYPtr(nullptr, &EVP_PKEY_free));
     }
     auto pkey = generate_key_pair();
     auto name = generateX509Name(common_name);
@@ -1083,7 +1081,7 @@ bool saveCertificate(const std::string& path, const std::vector<X509*>& certs,
         LOG_ERROR("Certificate chain is empty, nothing to save");
         return false;
     }
-    openssl_ptr<BIO, BIO_free_all> bio(BIO_new(BIO_s_mem()), BIO_free_all);
+    openssl_ptr<BIO, BIO_free_all> bio(BIO_new(BIO_s_mem()), &BIO_free_all);
     for (const auto& cert : certs)
     {
         if (!cert)
@@ -1114,7 +1112,7 @@ bool saveCertificate(const std::string& path, const std::vector<X509*>& certs,
 openssl_ptr<BIO, BIO_free_all> privateKeyToBio(
     const openssl_ptr<EVP_PKEY, EVP_PKEY_free>& pkey, bool pem = true)
 {
-    openssl_ptr<BIO, BIO_free_all> bio(BIO_new(BIO_s_mem()), BIO_free_all);
+    openssl_ptr<BIO, BIO_free_all> bio(BIO_new(BIO_s_mem()), &BIO_free_all);
     if (pem)
     {
         if (!PEM_write_bio_PrivateKey(bio.get(), pkey.get(), nullptr, nullptr,
@@ -1177,7 +1175,7 @@ EVP_PKEYPtr getPublicKeyFromCert(const openssl_ptr<X509, X509_free>& cert)
     if (!cert)
     {
         LOG_ERROR("Certificate pointer is null");
-        return {nullptr, EVP_PKEY_free};
+        return {nullptr, &EVP_PKEY_free};
     }
     auto pkey = makeEVPPKeyPtr(X509_get_pubkey(cert.get()));
     if (!pkey)
@@ -1199,7 +1197,7 @@ std::string getPublicKeyStringFromCert(X509Ptr signcert)
         LOG_ERROR("Error: Unable to get public key from certificate.");
         return {};
     }
-    openssl_ptr<BIO, BIO_free_all> bio(BIO_new(BIO_s_mem()), BIO_free_all);
+    openssl_ptr<BIO, BIO_free_all> bio(BIO_new(BIO_s_mem()), &BIO_free_all);
     if (!PEM_write_bio_PUBKEY(bio.get(), pkey.get()))
     {
         LOG_ERROR("Failed to write certificate to BIO");

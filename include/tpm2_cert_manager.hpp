@@ -1,13 +1,17 @@
 #pragma once
 #include "cert_generator.hpp"
 
+#include <openssl/rand.h>
+
 #include <boost/asio/ssl.hpp>
 #include <boost/system/error_code.hpp>
 
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <random>
 #include <tuple>
 #include <utility>
 
@@ -37,7 +41,12 @@ class Tpm2CertManager
     static constexpr const char* TPM2_CREATE_PRIMARY_CMD =
         "tpm2_createprimary -C o -c {}";
 
-    static constexpr const char* TPM2_CREATE_KEY_CMD =
+    // ECC P-256 keys are preferred when supported by the TPM hardware.
+    // If ECC is not supported (e.g. RSA-only TPM), fallback to RSA-2048.
+    static constexpr const char* TPM2_CREATE_KEY_ECC_CMD =
+        R"(tpm2_create -C {} -g sha256 -G ecc256 -r {} -u {} -a "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign")";
+
+    static constexpr const char* TPM2_CREATE_KEY_RSA_CMD =
         R"(tpm2_create -C {} -g sha256 -G rsa2048 -r {} -u {} -a "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign")";
 
     static constexpr const char* TPM2_LOAD_KEY_CMD =
@@ -82,24 +91,47 @@ class Tpm2CertManager
     static constexpr const char* OPENSSL_REQ_NEW_CMD =
         R"(openssl req -new -provider tpm2 -provider default -key "handle:{}" -passin pass: -out {} -subj "{}" 2>&1)";
 
+    // {notBefore} and {notAfter} are filled at call time via certNotBefore()
+    // and certNotAfter().  notBefore is the Unix epoch so that clock drift /
+    // NTP jumps never cause X509_V_ERR_CERT_NOT_YET_VALID.  notAfter is 50
+    // years from the moment the certificate is created.
     static constexpr const char* OPENSSL_X509_SELFSIGN_CMD =
-        R"(openssl x509 -req -in {} -signkey "handle:{}" -provider tpm2 -provider default -passin pass: -out {} -days {} -set_serial {} 2>&1)";
+        R"(openssl x509 -req -in {} -signkey "handle:{}" -provider tpm2 -provider default -passin pass: -out {} -set_serial {} -not_before {} -not_after {} 2>&1)";
 
     static constexpr const char* OPENSSL_X509_SELFSIGN_EXT_CMD =
-        R"(openssl x509 -req -in {} -signkey "handle:{}" -provider tpm2 -provider default -passin pass: -out {} -days {} -set_serial {} -extfile {} -extensions {} 2>&1)";
+        R"(openssl x509 -req -in {} -signkey "handle:{}" -provider tpm2 -provider default -passin pass: -out {} -set_serial {} -not_before {} -not_after {} -extfile {} -extensions {} 2>&1)";
 
     static constexpr const char* OPENSSL_X509_CA_SIGN_CMD =
-        R"(openssl x509 -req -in {} -CA {} -CAkey "handle:{}" -provider tpm2 -provider default -passin pass: -set_serial {} -out {} -days {} 2>&1)";
+        R"(openssl x509 -req -in {} -CA {} -CAkey "handle:{}" -provider tpm2 -provider default -passin pass: -set_serial {} -out {} -not_before {} -not_after {} 2>&1)";
 
     static constexpr const char* OPENSSL_X509_CA_SIGN_EXT_CMD =
-        R"(openssl x509 -req -in {} -CA {} -CAkey "handle:{}" -provider tpm2 -provider default -propquery '?provider=tpm2' -set_serial {} -out {} -days {} -extfile {} -extensions {} 2>&1)";
+        R"(openssl x509 -req -in {} -CA {} -CAkey "handle:{}" -provider tpm2 -provider default -passin pass: -set_serial {} -out {} -not_before {} -not_after {} -extfile {} -extensions {} 2>&1)";
 
-    Tpm2CertManager() : libCtx(OSSL_LIB_CTX_new())
+    // Returns the fixed notBefore date: Unix epoch in ASN1 GeneralizedTime.
+    static std::string certNotBefore()
     {
-        if (libCtx == nullptr)
-        {
-            throw std::runtime_error("Failed to allocate OSSL_LIB_CTX");
-        }
+        return "19700101000000Z";
+    }
+
+    // Returns notAfter = now + 50 years in ASN1 GeneralizedTime
+    // (YYYYMMDDHHMMSSZ).
+    static std::string certNotAfter()
+    {
+        using namespace std::chrono;
+        auto now = system_clock::now();
+        // Add 50 years as days (365.2425 average days/year).
+        auto future = now + duration_cast<system_clock::duration>(years{50});
+        std::time_t t = system_clock::to_time_t(future);
+        std::tm tm{};
+        // NOLINTNEXTLINE(concurrency-mt-unsafe)
+        gmtime_r(&t, &tm);
+        return std::format("{:04}{:02}{:02}{:02}{:02}{:02}Z", tm.tm_year + 1900,
+                           tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
+                           tm.tm_sec);
+    }
+
+    Tpm2CertManager()
+    {
         initialize();
     }
 
@@ -108,8 +140,9 @@ class Tpm2CertManager
      */
     void initialize()
     {
-        // Load default provider first (required for SSL/TLS operations)
-        defaultProvider = OSSL_PROVIDER_load(libCtx, "default");
+        // Load default provider first into global context (required for SSL/TLS
+        // operations)
+        defaultProvider = OSSL_PROVIDER_load(nullptr, "default");
         if (!defaultProvider)
         {
             LOG_ERROR("Failed to load default provider");
@@ -128,8 +161,9 @@ class Tpm2CertManager
             // Continue anyway - provider may have default configuration
         }
 
-        // Load TPM2 provider
-        tpmProvider = OSSL_PROVIDER_load(libCtx, "tpm2");
+        // Load TPM2 provider into global context so SSL_CTX instances can
+        // access it
+        tpmProvider = OSSL_PROVIDER_load(nullptr, "tpm2");
 
         if (tpmProvider)
         {
@@ -167,11 +201,27 @@ class Tpm2CertManager
         if (tpmProviderHandle)
         {
             dlclose(tpmProviderHandle);
+            tpmProviderHandle = nullptr;
         }
         if (libCtx)
         {
             OSSL_LIB_CTX_free(libCtx);
+            libCtx = nullptr;
         }
+    }
+
+    static bool isEccSupported()
+    {
+        static int supported = -1;
+        if (supported == -1)
+        {
+            int ret = system( // NOLINT(concurrency-mt-unsafe)
+                "tpm2_getcap algorithms 2>/dev/null | grep -q '^ecc:'");
+            supported = (ret == 0) ? 1 : 0;
+            LOG_INFO("TPM ECC algorithm support: {}",
+                     (supported == 1) ? "yes" : "no");
+        }
+        return supported == 1;
     }
 
     /**
@@ -427,17 +477,14 @@ class Tpm2CertManager
         int result = 0;
         if (password.empty())
         {
-            result = PEM_write_PrivateKey(fp.get(), key.get(), nullptr, nullptr,
-                                          0, nullptr, nullptr);
+            result = PEM_write_PKCS8PrivateKey(fp.get(), key.get(), nullptr,
+                                               nullptr, 0, nullptr, nullptr);
         }
         else
         {
-            // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
-            result = PEM_write_PrivateKey(
-                fp.get(), key.get(), EVP_aes_256_cbc(),
-                reinterpret_cast<const unsigned char*>(password.c_str()),
+            result = PEM_write_PKCS8PrivateKey(
+                fp.get(), key.get(), EVP_aes_256_gcm(), password.c_str(),
                 static_cast<int>(password.length()), nullptr, nullptr);
-            // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
         }
 
         if (result != 1)
@@ -572,8 +619,17 @@ class Tpm2CertManager
                                            const std::string& outPrivate,
                                            const std::string& outPublic)
     {
-        auto ec = executeTPMCommand(TPM2_CREATE_KEY_CMD, primaryContext,
-                                    outPrivate, outPublic);
+        const char* cmdTemplate = isEccSupported() ? TPM2_CREATE_KEY_ECC_CMD
+                                                   : TPM2_CREATE_KEY_RSA_CMD;
+        auto ec = executeTPMCommand(cmdTemplate, primaryContext, outPrivate,
+                                    outPublic);
+        if (ec && isEccSupported())
+        {
+            LOG_WARNING("ECC key creation failed, falling back to RSA2048");
+            ec = executeTPMCommand(TPM2_CREATE_KEY_RSA_CMD, primaryContext,
+                                   outPrivate, outPublic);
+        }
+
         if (ec)
         {
             LOG_ERROR("Failed to create TPM key");
@@ -604,7 +660,8 @@ class Tpm2CertManager
         // Ignore error - it's OK if no key exists at this handle
 
         // Step 2: Load key
-        std::string tempCtx = "/tmp/temp_key.ctx";
+        TempDir td;
+        std::string tempCtx = td.path("temp_key.ctx");
         auto ec = executeTPMCommand(TPM2_LOAD_KEY_CMD, primaryContext,
                                     privateBlob, publicBlob, tempCtx);
         if (ec)
@@ -621,9 +678,6 @@ class Tpm2CertManager
             LOG_ERROR("Failed to persist TPM key at {}", persistentHandle);
             return ec;
         }
-
-        // Cleanup temp context
-        std::filesystem::remove(tempCtx);
 
         LOG_INFO("TPM key persisted at {}", persistentHandle);
         return boost::system::error_code{};
@@ -663,25 +717,26 @@ class Tpm2CertManager
      */
     boost::system::error_code selfSignCertificateWithTPM(
         const std::string& csrFile, const std::string& tpmKeyHandle,
-        const std::string& outCert, int days,
+        const std::string& outCert, [[maybe_unused]] int days,
         const std::string& extensions = "")
     {
-        // Generate a random serial number
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<uint64_t> dis;
-        uint64_t serial = dis(gen);
+        // Generate a cryptographically secure random serial number
+        uint64_t serial = 0;
+        std::array<unsigned char, sizeof(serial)> serialBytes{};
+        RAND_bytes(serialBytes.data(), static_cast<int>(serialBytes.size()));
+        std::memcpy(&serial, serialBytes.data(), sizeof(serial));
 
         if (!extensions.empty())
         {
             // Create a temporary config file for extensions
-            std::string extFile = "/tmp/cert_ext.cnf";
+            TempDir td;
+            std::string extFile = td.path("cert_ext.cnf");
             std::ofstream ofs(extFile);
             if (extensions == "v3_ca")
             {
                 ofs << "[v3_ca]\n";
                 ofs << "basicConstraints = critical,CA:TRUE\n";
-                ofs << "keyUsage = critical,keyCertSign,cRLSign\n";
+                ofs << "keyUsage = critical,digitalSignature,keyCertSign,cRLSign\n";
                 ofs << "subjectKeyIdentifier = hash\n";
                 ofs << "authorityKeyIdentifier = keyid:always,issuer\n";
             }
@@ -693,9 +748,11 @@ class Tpm2CertManager
             }
             ofs.close();
 
-            auto ec = executeTPMCommand(OPENSSL_X509_SELFSIGN_EXT_CMD, csrFile,
-                                        tpmKeyHandle, outCert, days, serial,
-                                        extFile, extensions);
+            auto notBefore = certNotBefore();
+            auto notAfter = certNotAfter();
+            auto ec = executeTPMCommand(
+                OPENSSL_X509_SELFSIGN_EXT_CMD, csrFile, tpmKeyHandle, outCert,
+                serial, notBefore, notAfter, extFile, extensions);
             if (ec)
             {
                 LOG_ERROR("Failed to self-sign certificate with TPM key");
@@ -704,8 +761,11 @@ class Tpm2CertManager
         }
         else
         {
+            auto notBefore = certNotBefore();
+            auto notAfter = certNotAfter();
             auto ec = executeTPMCommand(OPENSSL_X509_SELFSIGN_CMD, csrFile,
-                                        tpmKeyHandle, outCert, days, serial);
+                                        tpmKeyHandle, outCert, serial,
+                                        notBefore, notAfter);
             if (ec)
             {
                 LOG_ERROR("Failed to self-sign certificate with TPM key");
@@ -715,6 +775,112 @@ class Tpm2CertManager
 
         LOG_INFO("Certificate self-signed with TPM key: {}", outCert);
         return boost::system::error_code{};
+    }
+
+    /**
+     * @brief Write an OpenSSL extensions file for a server or client entity
+     * certificate.
+     * @param extFile Output extensions file path
+     * @param extensions Section name: "v3_server" or "v3_client"
+     */
+    /**
+     * @brief RAII owner of a private 0700 temporary directory.
+     *
+     * Creates a unique directory under the system temp path via mkdtemp.
+     * Because the directory is mode 0700 and owned by the daemon's UID, no
+     * other local user or process can observe, open, or race-replace files
+     * placed inside it.  The entire directory tree is removed on destruction.
+     *
+     * Usage:
+     *   TempDir td;
+     *   std::string keyFile = td.path("key.priv");   // e.g.
+     * /tmp/tpm-XXXXXX/key.priv
+     */
+    class TempDir
+    {
+      public:
+        TempDir()
+        {
+            // mkdtemp(3) requires a writable char[] template — it replaces the
+            // trailing XXXXXX in-place and atomically mkdir's the result with
+            // mode 0700.  No other user can observe or access files created
+            // inside the returned directory.
+            std::string tmpl = "/tmp/tpm-XXXXXX";
+            if (mkdtemp(tmpl.data()) == nullptr)
+            {
+                throw std::runtime_error(
+                    "TempDir: mkdtemp failed to create private temp directory");
+            }
+            dir_ = tmpl;
+        }
+
+        ~TempDir()
+        {
+            if (!dir_.empty())
+            {
+                std::filesystem::remove_all(dir_);
+            }
+        }
+
+        // Non-copyable, non-movable — owns the directory lifetime.
+        TempDir(const TempDir&) = delete;
+        TempDir& operator=(const TempDir&) = delete;
+        TempDir(TempDir&&) = delete;
+        TempDir& operator=(TempDir&&) = delete;
+
+        /** Return the full path to a named file inside this private directory.
+         */
+        std::string path(const std::string& filename) const
+        {
+            return (std::filesystem::path(dir_) / filename).string();
+        }
+
+        /** Return the directory path itself. */
+        const std::string& dir() const
+        {
+            return dir_;
+        }
+
+      private:
+        std::string dir_;
+    };
+
+    static void writeEntityExtFile(const std::string& extFile,
+                                   const std::string& extensions)
+    {
+        std::ofstream ofs(extFile);
+        if (extensions == "v3_server")
+        {
+            ofs << "[v3_server]\n";
+            ofs << "basicConstraints = CA:FALSE\n";
+            if (isEccSupported())
+            {
+                ofs << "keyUsage = critical,digitalSignature\n";
+            }
+            else
+            {
+                ofs << "keyUsage = critical,digitalSignature,keyEncipherment\n";
+            }
+            ofs << "extendedKeyUsage = serverAuth\n";
+            ofs << "subjectKeyIdentifier = hash\n";
+            ofs << "authorityKeyIdentifier = keyid,issuer\n";
+        }
+        else if (extensions == "v3_client")
+        {
+            ofs << "[v3_client]\n";
+            ofs << "basicConstraints = CA:FALSE\n";
+            if (isEccSupported())
+            {
+                ofs << "keyUsage = critical,digitalSignature\n";
+            }
+            else
+            {
+                ofs << "keyUsage = critical,digitalSignature,keyEncipherment\n";
+            }
+            ofs << "extendedKeyUsage = clientAuth\n";
+            ofs << "subjectKeyIdentifier = hash\n";
+            ofs << "authorityKeyIdentifier = keyid,issuer\n";
+        }
     }
 
     /**
@@ -729,43 +895,27 @@ class Tpm2CertManager
      */
     boost::system::error_code signCertificateWithTPMCA(
         const std::string& csrFile, const std::string& caCertFile,
-        const std::string& caKeyHandle, const std::string& outCert, int days,
-        const std::string& extensions = "")
+        const std::string& caKeyHandle, const std::string& outCert,
+        [[maybe_unused]] int days, const std::string& extensions = "")
     {
-        // Generate a random serial number
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<uint64_t> dis;
-        uint64_t serial = dis(gen);
+        // Generate a cryptographically secure random serial number
+        uint64_t serial = 0;
+        std::array<unsigned char, sizeof(serial)> serialBytes{};
+        RAND_bytes(serialBytes.data(), static_cast<int>(serialBytes.size()));
+        std::memcpy(&serial, serialBytes.data(), sizeof(serial));
 
         if (!extensions.empty())
         {
             // Create a temporary config file for extensions
-            std::string extFile = "/tmp/cert_ext_ca_sign.cnf";
-            std::ofstream ofs(extFile);
-            if (extensions == "v3_server")
-            {
-                ofs << "[v3_server]\n";
-                ofs << "basicConstraints = CA:FALSE\n";
-                ofs << "keyUsage = critical,digitalSignature,keyEncipherment\n";
-                ofs << "extendedKeyUsage = serverAuth\n";
-                ofs << "subjectKeyIdentifier = hash\n";
-                ofs << "authorityKeyIdentifier = keyid,issuer\n";
-            }
-            else if (extensions == "v3_client")
-            {
-                ofs << "[v3_client]\n";
-                ofs << "basicConstraints = CA:FALSE\n";
-                ofs << "keyUsage = critical,digitalSignature,keyEncipherment\n";
-                ofs << "extendedKeyUsage = clientAuth\n";
-                ofs << "subjectKeyIdentifier = hash\n";
-                ofs << "authorityKeyIdentifier = keyid,issuer\n";
-            }
-            ofs.close();
+            TempDir td;
+            std::string extFile = td.path("cert_ext_ca_sign.cnf");
+            writeEntityExtFile(extFile, extensions);
 
-            auto ec = executeTPMCommand(OPENSSL_X509_CA_SIGN_EXT_CMD, csrFile,
-                                        caCertFile, caKeyHandle, serial,
-                                        outCert, days, extFile, extensions);
+            auto notBefore = certNotBefore();
+            auto notAfter = certNotAfter();
+            auto ec = executeTPMCommand(
+                OPENSSL_X509_CA_SIGN_EXT_CMD, csrFile, caCertFile, caKeyHandle,
+                serial, outCert, notBefore, notAfter, extFile, extensions);
             if (ec)
             {
                 LOG_ERROR("Failed to sign certificate with TPM CA key");
@@ -774,9 +924,11 @@ class Tpm2CertManager
         }
         else
         {
-            auto ec =
-                executeTPMCommand(OPENSSL_X509_CA_SIGN_CMD, csrFile, caCertFile,
-                                  caKeyHandle, serial, outCert, days);
+            auto notBefore = certNotBefore();
+            auto notAfter = certNotAfter();
+            auto ec = executeTPMCommand(OPENSSL_X509_CA_SIGN_CMD, csrFile,
+                                        caCertFile, caKeyHandle, serial,
+                                        outCert, notBefore, notAfter);
             if (ec)
             {
                 LOG_ERROR("Failed to sign certificate with TPM CA key");
@@ -809,10 +961,12 @@ class Tpm2CertManager
         }
 
         // Read the certificate file to extract only the leaf certificate
-        std::string tempLeafCertFile = "/tmp/tpm_leaf_cert.pem";
+        TempDir td;
+        std::string tempLeafCertFile = td.path("tpm_leaf_cert.pem");
 
-        auto extractResult = executeTPMCommand(
-            "openssl x509 -in {} -out {} 2>&1", certFile, tempLeafCertFile);
+        auto extractResult =
+            executeTPMCommand("openssl x509 -in {} -out {} 2>/dev/null",
+                              certFile, tempLeafCertFile);
         if (extractResult)
         {
             LOG_ERROR("Failed to extract leaf certificate from {}", certFile);
@@ -828,7 +982,6 @@ class Tpm2CertManager
             LOG_ERROR(
                 "Certificate size ({} bytes) exceeds TPM NV limit ({} bytes) for index {}",
                 certSize, MAX_TPM_NV_SIZE, nvIndex);
-            std::filesystem::remove(tempLeafCertFile);
             return boost::system::errc::make_error_code(
                 boost::system::errc::file_too_large);
         }
@@ -847,7 +1000,6 @@ class Tpm2CertManager
             if (deleteResult)
             {
                 LOG_ERROR("Failed to delete existing TPM NV index {}", nvIndex);
-                std::filesystem::remove(tempLeafCertFile);
                 return deleteResult;
             }
         }
@@ -861,7 +1013,6 @@ class Tpm2CertManager
         {
             LOG_ERROR("Failed to define TPM NV index {} with size {}", nvIndex,
                       certSize);
-            std::filesystem::remove(tempLeafCertFile);
             return defineResult;
         }
 
@@ -872,12 +1023,8 @@ class Tpm2CertManager
         if (writeResult)
         {
             LOG_ERROR("Failed to write certificate to TPM NV {}", nvIndex);
-            std::filesystem::remove(tempLeafCertFile);
             return writeResult;
         }
-
-        // Cleanup temporary file
-        std::filesystem::remove(tempLeafCertFile);
 
         LOG_INFO("Leaf certificate ({} bytes) stored in TPM NV index {}",
                  certSize, nvIndex);
@@ -893,9 +1040,12 @@ class Tpm2CertManager
     static boost::system::error_code readCertificateFromTPMNV(
         const std::string& nvIndex, X509Ptr& outCert)
     {
-        std::string tempFile = std::format("/tmp/cert_{}.pem", nvIndex);
-        std::string cmd =
-            std::format("tpm2_nvread -C o {} > {} 2>&1", nvIndex, tempFile);
+        TempDir td;
+        std::string tempFile = td.path("cert.pem");
+        // Redirect only stdout to the temp file; send stderr to /dev/null so
+        // that tpm2-tools warning/info lines are not mixed into the PEM data.
+        std::string cmd = std::format("tpm2_nvread -C o {} > {} 2>/dev/null",
+                                      nvIndex, tempFile);
 
         // NOLINTNEXTLINE(concurrency-mt-unsafe)
         if (system(cmd.c_str()) != 0)
@@ -910,14 +1060,12 @@ class Tpm2CertManager
         if (!fp)
         {
             LOG_ERROR("Failed to open temp certificate file");
-            std::filesystem::remove(tempFile);
             return boost::system::errc::make_error_code(
                 boost::system::errc::io_error);
         }
 
         X509* cert = PEM_read_X509(fp.get(), nullptr, nullptr, nullptr);
-        fp.reset(); // Close file before removing
-        std::filesystem::remove(tempFile);
+        fp.reset(); // Close file before parsing
 
         if (!cert)
         {
@@ -983,6 +1131,66 @@ class Tpm2CertManager
      * "0x81000001")
      * @return error_code indicating success or failure
      */
+    // Inspect a PEM key file and return the tpm2_import -G algorithm string.
+    // The CA is generated with `openssl genpkey -algorithm EC
+    // -pkeyopt ec_paramgen_curve:P-384` which produces PKCS#8 PEM
+    // ("-----BEGIN PRIVATE KEY-----").  We ask OpenSSL to print the curve
+    // name and map it to the tpm2_import token.
+    static std::string detectTpmAlgo(const std::string& keyFile)
+    {
+        // Ask openssl for the curve name; output is like "ASN1 OID: secp384r1"
+        std::string cmd = std::format(
+            "openssl pkey -in {} -noout -text 2>&1 | grep -i 'ASN1 OID'",
+            keyFile);
+        // NOLINTNEXTLINE(concurrency-mt-unsafe)
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe)
+        {
+            return "ecc384"; // safe default for the shipped P-384 CA key
+        }
+        std::array<char, 256> buf{};
+        std::string out;
+        while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr)
+        {
+            out += buf.data();
+        }
+        pclose(pipe);
+
+        if (out.find("384") != std::string::npos)
+        {
+            return "ecc384";
+        }
+        if (out.find("256") != std::string::npos)
+        {
+            return "ecc256";
+        }
+        if (out.find("521") != std::string::npos)
+        {
+            return "ecc521";
+        }
+        // Fall back: check for RSA
+        std::string rsaCmd = std::format(
+            "openssl pkey -in {} -noout -text 2>&1 | grep -i 'rsa'", keyFile);
+        // NOLINTNEXTLINE(concurrency-mt-unsafe)
+        FILE* rsaPipe = popen(rsaCmd.c_str(), "r");
+        if (rsaPipe)
+        {
+            std::array<char, 256> rbuf{};
+            std::string rout;
+            while (fgets(rbuf.data(), static_cast<int>(rbuf.size()), rsaPipe) !=
+                   nullptr)
+            {
+                rout += rbuf.data();
+            }
+            pclose(rsaPipe);
+            if (!rout.empty())
+            {
+                return "rsa2048";
+            }
+        }
+        return "ecc384"; // shipped CA default
+    }
+
     boost::system::error_code importPrivateKeyToTPM(
         const std::string& keyFile, const std::string& persistentHandle)
     {
@@ -994,8 +1202,9 @@ class Tpm2CertManager
                 boost::system::errc::no_such_file_or_directory);
         }
 
-        // Create primary key context
-        std::string primaryCtx = "/tmp/primary_import.ctx";
+        // Create primary key context inside a private temp dir
+        TempDir td;
+        std::string primaryCtx = td.path("primary_import.ctx");
         auto ec = createTPMPrimaryKey(primaryCtx);
         if (ec)
         {
@@ -1003,31 +1212,42 @@ class Tpm2CertManager
             return ec;
         }
 
-        // Import the existing PEM key into TPM
-        std::string pubFile = "/tmp/imported_key.pub";
-        std::string privFile = "/tmp/imported_key.priv";
+        // The CA is a PKCS#8 EC key (openssl genpkey -algorithm EC
+        // -pkeyopt ec_paramgen_curve:P-384).  tpm2_import requires a bare
+        // SEC1 DER key.  Convert via:
+        //   openssl pkcs8 -nocrypt (→ PEM SEC1) | openssl ec -outform DER
+        // Use a pipe so no intermediate SEC1 PEM touches disk.
+        const std::string tpmAlgo = detectTpmAlgo(keyFile);
+        LOG_INFO("Importing key {} as TPM algo {}", keyFile, tpmAlgo);
+
+        std::string derKeyFile = td.path("imported_key.der");
+        ec = executeTPMCommand("openssl pkcs8 -nocrypt -in {} 2>/dev/null"
+                               " | openssl ec -outform DER -out {} 2>&1",
+                               keyFile, derKeyFile);
+        if (ec)
+        {
+            LOG_ERROR("Failed to convert PKCS#8 key {} to SEC1 DER", keyFile);
+            return ec;
+        }
+
+        // Import the SEC1 DER key into TPM.
+        std::string pubFile = td.path("imported_key.pub");
+        std::string privFile = td.path("imported_key.priv");
         std::string importCmd =
-            std::format("tpm2_import -C {} -G rsa2048 -i {} -u {} -r {} 2>&1",
-                        primaryCtx, keyFile, pubFile, privFile);
+            std::format("tpm2_import -C {} -G {} -i {} -u {} -r {} 2>&1",
+                        primaryCtx, tpmAlgo, derKeyFile, pubFile, privFile);
 
         // NOLINTNEXTLINE(concurrency-mt-unsafe)
         if (system(importCmd.c_str()) != 0)
         {
             LOG_ERROR("Failed to import private key {} into TPM", keyFile);
-            std::filesystem::remove(primaryCtx);
             return boost::system::errc::make_error_code(
                 boost::system::errc::io_error);
         }
 
-        // Load and persist the imported key
+        // Load and persist the imported key (td cleans up all temp files)
         ec = loadAndPersistTPMKey(primaryCtx, privFile, pubFile,
                                   persistentHandle);
-
-        // Cleanup temporary files
-        std::filesystem::remove(primaryCtx);
-        std::filesystem::remove(pubFile);
-        std::filesystem::remove(privFile);
-
         if (ec)
         {
             LOG_ERROR("Failed to persist imported key at handle {}",
@@ -1052,52 +1272,49 @@ class Tpm2CertManager
     boost::system::error_code createCACertificateInTPM(
         const std::string& persistentHandle, const std::string& nvIndex,
         const std::string& subject, int days,
-        const std::string& primaryContext = "/tmp/primary.ctx")
+        const std::string& primaryContext = "")
     {
+        TempDir td;
         // Create primary key if needed
-        if (!std::filesystem::exists(primaryContext))
+        std::string primaryCtx =
+            primaryContext.empty() ? td.path("primary.ctx") : primaryContext;
+        if (!std::filesystem::exists(primaryCtx))
         {
-            auto ec = createTPMPrimaryKey(primaryContext);
+            auto ec = createTPMPrimaryKey(primaryCtx);
             if (ec)
                 return ec;
         }
 
         // Create CA key
-        std::string privBlob = "/tmp/ca_key.priv";
-        std::string pubBlob = "/tmp/ca_key.pub";
-        auto ec = createTPMKey(primaryContext, privBlob, pubBlob);
+        std::string privBlob = td.path("ca_key.priv");
+        std::string pubBlob = td.path("ca_key.pub");
+        auto ec = createTPMKey(primaryCtx, privBlob, pubBlob);
         if (ec)
             return ec;
 
         // Load and persist
-        ec = loadAndPersistTPMKey(primaryContext, privBlob, pubBlob,
+        ec = loadAndPersistTPMKey(primaryCtx, privBlob, pubBlob,
                                   persistentHandle);
         if (ec)
             return ec;
 
         // Generate CSR
-        std::string csrFile = "/tmp/ca.csr";
+        std::string csrFile = td.path("ca.csr");
         ec = generateCSRWithTPMKey(persistentHandle, subject, csrFile);
         if (ec)
             return ec;
 
         // Self-sign
-        std::string certFile = "/tmp/ca_cert.pem";
+        std::string certFile = td.path("ca_cert.pem");
         ec = selfSignCertificateWithTPM(csrFile, persistentHandle, certFile,
                                         days, "v3_ca");
         if (ec)
             return ec;
 
-        // Store in NV
+        // Store in NV (td cleans up all temp files on scope exit)
         ec = storeCertificateInTPMNV(certFile, nvIndex);
         if (ec)
             return ec;
-
-        // Cleanup temp files
-        std::filesystem::remove(privBlob);
-        std::filesystem::remove(pubBlob);
-        std::filesystem::remove(csrFile);
-        std::filesystem::remove(certFile);
 
         LOG_INFO("CA certificate created in TPM: {} / {}", persistentHandle,
                  nvIndex);
@@ -1121,31 +1338,44 @@ class Tpm2CertManager
         const std::string& subject, const std::string& caHandle,
         const std::string& caNVIndex, int days,
         const std::string& extensions = "",
-        const std::string& primaryContext = "/tmp/primary.ctx")
+        const std::string& primaryContext = "")
     {
+        TempDir td;
+        std::string primaryCtx =
+            primaryContext.empty() ? td.path("primary.ctx") : primaryContext;
+
+        // Always create a fresh primary key — a context file from a different
+        // invocation (or a different TempDir) cannot be reused across sessions.
+        if (!std::filesystem::exists(primaryCtx))
+        {
+            auto ec = createTPMPrimaryKey(primaryCtx);
+            if (ec)
+                return ec;
+        }
+
         // Create entity key
-        std::string privBlob = "/tmp/entity_key.priv";
-        std::string pubBlob = "/tmp/entity_key.pub";
-        auto ec = createTPMKey(primaryContext, privBlob, pubBlob);
+        std::string privBlob = td.path("entity_key.priv");
+        std::string pubBlob = td.path("entity_key.pub");
+        auto ec = createTPMKey(primaryCtx, privBlob, pubBlob);
         if (ec)
             return ec;
 
         // Load and persist
-        ec = loadAndPersistTPMKey(primaryContext, privBlob, pubBlob,
+        ec = loadAndPersistTPMKey(primaryCtx, privBlob, pubBlob,
                                   persistentHandle);
         if (ec)
             return ec;
 
         // Generate CSR
-        std::string csrFile = "/tmp/entity.csr";
+        std::string csrFile = td.path("entity.csr");
         ec = generateCSRWithTPMKey(persistentHandle, subject, csrFile);
         if (ec)
             return ec;
 
         // Read CA cert from NV
-        std::string caCertFile = "/tmp/ca_cert.pem";
-        std::string readCmd =
-            std::format("tpm2_nvread -C o {} > {} 2>&1", caNVIndex, caCertFile);
+        std::string caCertFile = td.path("ca_cert.pem");
+        std::string readCmd = std::format(
+            "tpm2_nvread -C o {} > {} 2>/dev/null", caNVIndex, caCertFile);
         // NOLINTNEXTLINE(concurrency-mt-unsafe)
         if (system(readCmd.c_str()) != 0)
         {
@@ -1155,26 +1385,105 @@ class Tpm2CertManager
         }
 
         // Sign with CA
-        std::string certFile = "/tmp/entity_cert.pem";
+        std::string certFile = td.path("entity_cert.pem");
         ec = signCertificateWithTPMCA(csrFile, caCertFile, caHandle, certFile,
                                       days, extensions);
         if (ec)
             return ec;
 
-        // Store in NV
+        // Store in NV (td cleans up all temp files on scope exit)
         ec = storeCertificateInTPMNV(certFile, nvIndex);
         if (ec)
             return ec;
 
-        // Cleanup
-        std::filesystem::remove(privBlob);
-        std::filesystem::remove(pubBlob);
-        std::filesystem::remove(csrFile);
-        std::filesystem::remove(caCertFile);
-        std::filesystem::remove(certFile);
-
         LOG_INFO("Entity certificate created in TPM: {} / {}", persistentHandle,
                  nvIndex);
+        return boost::system::error_code{};
+    }
+
+    /**
+     * @brief Create entity certificate signed by a filesystem CA (Simics mode)
+     *
+     * Generates the entity key inside the TPM, builds a CSR from it and signs
+     * the CSR with the provisioned CA key/cert held on the filesystem (plain
+     * openssl, no TPM provider needed).  The signed cert is stored in nvIndex.
+     *
+     * @param persistentHandle TPM handle for entity key
+     * @param nvIndex NV index for entity cert
+     * @param subject Entity subject
+     * @param caKeyFile Filesystem path to the provisioned CA private key
+     * @param caCertFile Filesystem path to the provisioned CA certificate
+     * @param extensions Certificate extensions section ("v3_server" or
+     * "v3_client")
+     * @param primaryContext Primary key context file
+     * @return error_code indicating success or failure
+     */
+    boost::system::error_code createEntityCertificateSignedByFilesystemCA(
+        const std::string& persistentHandle, const std::string& nvIndex,
+        const std::string& subject, const std::string& caKeyFile,
+        const std::string& caCertFile, const std::string& extensions,
+        const std::string& primaryContext = "")
+    {
+        TempDir td;
+        std::string primaryCtx =
+            primaryContext.empty() ? td.path("primary.ctx") : primaryContext;
+        if (!std::filesystem::exists(primaryCtx))
+        {
+            auto ec = createTPMPrimaryKey(primaryCtx);
+            if (ec)
+                return ec;
+        }
+
+        // Create entity key
+        std::string privBlob = td.path("entity_key.priv");
+        std::string pubBlob = td.path("entity_key.pub");
+        auto ec = createTPMKey(primaryCtx, privBlob, pubBlob);
+        if (ec)
+            return ec;
+
+        // Load and persist
+        ec = loadAndPersistTPMKey(primaryCtx, privBlob, pubBlob,
+                                  persistentHandle);
+        if (ec)
+            return ec;
+
+        // Generate CSR
+        std::string csrFile = td.path("entity.csr");
+        ec = generateCSRWithTPMKey(persistentHandle, subject, csrFile);
+        if (ec)
+            return ec;
+
+        // Sign with the filesystem CA key
+        // Generate a cryptographically secure random serial number
+        uint64_t serial = 0;
+        std::array<unsigned char, sizeof(serial)> serialBytes{};
+        RAND_bytes(serialBytes.data(), static_cast<int>(serialBytes.size()));
+        std::memcpy(&serial, serialBytes.data(), sizeof(serial));
+        auto notBefore = certNotBefore();
+        auto notAfter = certNotAfter();
+        std::string extFile = td.path("cert_ext_fs_ca_sign.cnf");
+        writeEntityExtFile(extFile, extensions);
+
+        std::string certFile = td.path("entity_cert.pem");
+        ec = executeTPMCommand(
+            "openssl x509 -req -in {} -CA {} -CAkey {} -passin pass:"
+            " -set_serial {} -out {} -not_before {} -not_after {}"
+            " -extfile {} -extensions {} 2>&1",
+            csrFile, caCertFile, caKeyFile, serial, certFile, notBefore,
+            notAfter, extFile, extensions);
+        if (ec)
+        {
+            LOG_ERROR("Failed to sign entity CSR with filesystem CA key");
+            return ec;
+        }
+
+        // Store in NV (td cleans up all temp files on scope exit)
+        ec = storeCertificateInTPMNV(certFile, nvIndex);
+        if (ec)
+            return ec;
+
+        LOG_INFO("Entity certificate signed by filesystem CA: {} / {}",
+                 persistentHandle, nvIndex);
         return boost::system::error_code{};
     }
 
@@ -1209,7 +1518,7 @@ class Tpm2CertManager
                         boost::asio::ssl::context::single_dh_use);
 
         // Load server certificate from TPM NV
-        X509Ptr serverCert(nullptr, X509_free);
+        X509Ptr serverCert(nullptr, &X509_free);
         auto ec = readCertificateFromTPMNV(serverCertNV, serverCert);
         if (ec)
         {
@@ -1220,7 +1529,7 @@ class Tpm2CertManager
 
         // Load server private key from TPM
         std::string keyUri = std::format("handle:{}", serverKeyHandle);
-        EVP_PKEYPtr serverKey(nullptr, EVP_PKEY_free);
+        EVP_PKEYPtr serverKey(nullptr, &EVP_PKEY_free);
         ec = loadPrivateKeyFromTpm(keyUri, serverKey);
         if (ec)
         {
@@ -1231,6 +1540,19 @@ class Tpm2CertManager
 
         // Configure SSL context
         SSL_CTX* nativeCtx = ctx.native_handle();
+
+        // RSA keys on TPM hardware without RSAPSS support cannot sign TLS 1.3
+        // CertificateVerify or TLS 1.2 RSAPSS; restrict to TLS 1.2 with PKCS#1
+        // v1.5 sigalgs
+        if (!isEccSupported())
+        {
+            ctx.set_options(boost::asio::ssl::context::no_tlsv1_3);
+            SSL_CTX_set_max_proto_version(nativeCtx, TLS1_2_VERSION);
+            SSL_CTX_set1_sigalgs_list(nativeCtx,
+                                      "RSA+SHA256:RSA+SHA384:RSA+SHA512");
+            SSL_CTX_set1_client_sigalgs_list(
+                nativeCtx, "RSA+SHA256:RSA+SHA384:RSA+SHA512");
+        }
 
         // Set server certificate
         if (SSL_CTX_use_certificate(nativeCtx, serverCert.get()) != 1)
@@ -1243,7 +1565,7 @@ class Tpm2CertManager
 
         // Load and add server CA certificate to the server certificate chain
         // This is needed because we only store leaf certificates in TPM
-        X509Ptr serverCaCert(nullptr, X509_free);
+        X509Ptr serverCaCert(nullptr, &X509_free);
         ec = readCertificateFromTPMNV(serverCaCertNV, serverCaCert);
         if (ec)
         {
@@ -1290,7 +1612,7 @@ class Tpm2CertManager
         // Load truststore CA certificate for client verification
         if (requireClientCert)
         {
-            X509Ptr trustStoreCaCert(nullptr, X509_free);
+            X509Ptr trustStoreCaCert(nullptr, &X509_free);
             ec = readCertificateFromTPMNV(trustStoreCaCertNV, trustStoreCaCert);
             if (ec)
             {
@@ -1351,7 +1673,7 @@ class Tpm2CertManager
                         boost::asio::ssl::context::no_tlsv1 |
                         boost::asio::ssl::context::no_tlsv1_1);
         // Load client certificate from TPM NV
-        X509Ptr clientCert(nullptr, X509_free);
+        X509Ptr clientCert(nullptr, &X509_free);
         auto ec = readCertificateFromTPMNV(clientCertNV, clientCert);
         if (ec)
         {
@@ -1362,7 +1684,7 @@ class Tpm2CertManager
 
         // Load client private key from TPM
         std::string keyUri = std::format("handle:{}", clientKeyHandle);
-        EVP_PKEYPtr clientKey(nullptr, EVP_PKEY_free);
+        EVP_PKEYPtr clientKey(nullptr, &EVP_PKEY_free);
         ec = loadPrivateKeyFromTpm(keyUri, clientKey);
         if (ec)
         {
@@ -1373,6 +1695,17 @@ class Tpm2CertManager
 
         // Configure SSL context
         SSL_CTX* nativeCtx = ctx.native_handle();
+
+        // RSA keys on TPM hardware without RSAPSS support cannot sign TLS 1.3
+        // CertificateVerify or TLS 1.2 RSAPSS; restrict to TLS 1.2 with PKCS#1
+        // v1.5 sigalgs
+        if (!isEccSupported())
+        {
+            ctx.set_options(boost::asio::ssl::context::no_tlsv1_3);
+            SSL_CTX_set_max_proto_version(nativeCtx, TLS1_2_VERSION);
+            SSL_CTX_set1_sigalgs_list(nativeCtx,
+                                      "RSA+SHA256:RSA+SHA384:RSA+SHA512");
+        }
 
         // Set client certificate
         if (SSL_CTX_use_certificate(nativeCtx, clientCert.get()) != 1)
@@ -1385,7 +1718,7 @@ class Tpm2CertManager
 
         // Load and add client CA certificate to the client certificate chain
         // This is needed because we only store leaf certificates in TPM
-        X509Ptr clientCaCert(nullptr, X509_free);
+        X509Ptr clientCaCert(nullptr, &X509_free);
         ec = readCertificateFromTPMNV(clientCaCertNV, clientCaCert);
         if (ec)
         {
@@ -1432,7 +1765,7 @@ class Tpm2CertManager
         // Load truststore CA certificate for server verification
         if (verifyServer)
         {
-            X509Ptr trustStoreCaCert(nullptr, X509_free);
+            X509Ptr trustStoreCaCert(nullptr, &X509_free);
             ec = readCertificateFromTPMNV(trustStoreCaCertNV, trustStoreCaCert);
             if (ec)
             {
@@ -1636,15 +1969,16 @@ class Tpm2CertManager
             return true; // Not a failure, just skip TPM storage
         }
 
+        TempDir td;
         // Export the private key from persistent handle to a temporary file
-        std::string tempKeyFile =
-            std::format("/tmp/key_{}.priv.pem", persistentHandle);
+        std::string tempKeyFile = td.path("key.priv.pem");
+        std::string tempPubFile = td.path("key.pub");
 
-        // Use tpm2_readpublic and tpm2_evictcontrol to export the key
+        // Use tpm2_readpublic to export the public portion
         std::string exportCmd = std::format(
-            "tpm2_readpublic -c {} -o /tmp/key_{}.pub 2>&1 && "
-            "tpm2_print -t TPM2B_PUBLIC /tmp/key_{}.pub > {} 2>&1",
-            persistentHandle, persistentHandle, persistentHandle, tempKeyFile);
+            "tpm2_readpublic -c {} -o {} 2>&1 && "
+            "tpm2_print -t TPM2B_PUBLIC {} > {} 2>&1",
+            persistentHandle, tempPubFile, tempPubFile, tempKeyFile);
 
         // NOLINTNEXTLINE(concurrency-mt-unsafe)
         if (system(exportCmd.c_str()) != 0)
@@ -1652,9 +1986,6 @@ class Tpm2CertManager
             LOG_WARNING("Failed to export key from handle {} for NV storage, "
                         "continuing...",
                         persistentHandle);
-            std::filesystem::remove(tempKeyFile);
-            std::filesystem::remove(
-                std::format("/tmp/key_{}.pub", persistentHandle));
             return true; // Not critical, continue
         }
 
@@ -1673,9 +2004,6 @@ class Tpm2CertManager
             LOG_WARNING(
                 "Key size ({} bytes) exceeds TPM NV limit, skipping NV storage",
                 keySize);
-            std::filesystem::remove(tempKeyFile);
-            std::filesystem::remove(
-                std::format("/tmp/key_{}.pub", persistentHandle));
             return true;
         }
 
@@ -1703,9 +2031,6 @@ class Tpm2CertManager
             LOG_WARNING(
                 "Failed to define TPM NV index {} for key, continuing...",
                 nvIndex);
-            std::filesystem::remove(tempKeyFile);
-            std::filesystem::remove(
-                std::format("/tmp/key_{}.pub", persistentHandle));
             return true;
         }
 
@@ -1718,17 +2043,10 @@ class Tpm2CertManager
         {
             LOG_WARNING("Failed to write key to TPM NV {}, continuing...",
                         nvIndex);
-            std::filesystem::remove(tempKeyFile);
-            std::filesystem::remove(
-                std::format("/tmp/key_{}.pub", persistentHandle));
             return true;
         }
 
-        // Cleanup temporary files
-        std::filesystem::remove(tempKeyFile);
-        std::filesystem::remove(
-            std::format("/tmp/key_{}.pub", persistentHandle));
-
+        // td destructor cleans up all temp files
         LOG_INFO(
             "Private key from handle {} stored in TPM NV index {} ({} bytes)",
             persistentHandle, nvIndex, keySize);
@@ -1742,9 +2060,9 @@ class Tpm2CertManager
      * @param primaryCtxPath Path for primary context file
      * @return true if successful, false otherwise
      */
-    bool createPrivateKeyInTPM(
-        const char* persistentHandle, const std::string& nvIndex = "",
-        const std::string& primaryCtxPath = "/tmp/primary_tpm.ctx")
+    bool createPrivateKeyInTPM(const char* persistentHandle,
+                               const std::string& nvIndex = "",
+                               const std::string& primaryCtxPath = "")
     {
         if (!isInitialized())
         {
@@ -1753,8 +2071,13 @@ class Tpm2CertManager
             return true; // Not a failure, just skip TPM storage
         }
 
+        TempDir td;
+        std::string primaryCtx = primaryCtxPath.empty()
+                                     ? td.path("primary_tpm.ctx")
+                                     : primaryCtxPath;
+
         // Step 1: Create TPM primary key
-        auto ec = createTPMPrimaryKey(primaryCtxPath);
+        auto ec = createTPMPrimaryKey(primaryCtx);
         if (ec)
         {
             LOG_ERROR("Failed to create TPM primary key: {}", ec.message());
@@ -1762,26 +2085,19 @@ class Tpm2CertManager
         }
 
         // Step 2: Create TPM key as child of primary
-        std::string privFile =
-            std::format("/tmp/key_{}.priv", persistentHandle);
-        std::string pubFile = std::format("/tmp/key_{}.pub", persistentHandle);
+        std::string privFile = td.path("key.priv");
+        std::string pubFile = td.path("key.pub");
 
-        ec = createTPMKey(primaryCtxPath, privFile, pubFile);
+        ec = createTPMKey(primaryCtx, privFile, pubFile);
         if (ec)
         {
             LOG_ERROR("Failed to create TPM key: {}", ec.message());
-            std::filesystem::remove(primaryCtxPath);
             return false;
         }
 
-        // Step 3: Load and persist the TPM key
-        ec = loadAndPersistTPMKey(primaryCtxPath, privFile, pubFile,
+        // Step 3: Load and persist the TPM key (td cleans up on scope exit)
+        ec = loadAndPersistTPMKey(primaryCtx, privFile, pubFile,
                                   persistentHandle);
-
-        // Cleanup temporary files
-        std::filesystem::remove(primaryCtxPath);
-        std::filesystem::remove(privFile);
-        std::filesystem::remove(pubFile);
 
         if (ec)
         {
@@ -1828,8 +2144,9 @@ class Tpm2CertManager
             return std::nullopt;
         }
 
+        TempDir td;
         // Generate CSR using TPM key
-        std::string csrFile = std::format("/tmp/cert_{}.csr", tpmKeyHandle);
+        std::string csrFile = td.path("cert.csr");
         auto ec = generateCSRWithTPMKey(tpmKeyHandle, subject, csrFile);
         if (ec)
         {
@@ -1839,7 +2156,7 @@ class Tpm2CertManager
         }
 
         // Sign certificate
-        std::string certFile = std::format("/tmp/cert_{}.pem", tpmKeyHandle);
+        std::string certFile = td.path("cert.pem");
 
         if (isCA || caCertPath.empty())
         {
@@ -1857,19 +2174,14 @@ class Tpm2CertManager
                                           certFile, daysValid, extension);
         }
 
-        // Cleanup CSR
-        std::filesystem::remove(csrFile);
-
         if (ec)
         {
             LOG_ERROR("Failed to sign certificate: {}", ec.message());
-            std::filesystem::remove(certFile);
             return std::nullopt;
         }
 
-        // Load the certificate
+        // Load the certificate (td cleans up on scope exit)
         auto cert = loadCertificate(certFile);
-        std::filesystem::remove(certFile);
 
         if (!cert)
         {

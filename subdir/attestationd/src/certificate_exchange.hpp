@@ -3,14 +3,38 @@
 #include "eventmethods.hpp"
 #include "eventqueue.hpp"
 #include "globaldefs.hpp"
+#include "tpm2_cert_manager.hpp"
+#include "tpm_handles.hpp"
 
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 #include <openssl/x509.h>
 
 #include <iomanip>
+#include <memory>
 #include <sstream>
 using namespace NSNAME;
 constexpr auto INSTALL_CERTIFICATES = "InstallCertificates";
 constexpr auto INSTALL_CERTIFICATES_RESP = "InstallCertificatesResp";
+
+// ---------------------------------------------------------------------------
+// TPM NV / handle constants — sourced from the shared tpm_handles.hpp.
+// Local aliases keep existing code in this file unchanged.
+// ---------------------------------------------------------------------------
+inline constexpr const char* ATTEST_TPM_CA_KEY_HANDLE = TPM_CA_KEY_HANDLE;
+inline constexpr const char* ATTEST_TPM_CA_CERT_NV = TPM_PEER_ROOT_CA_CERT_NV;
+// Peer CA received during certificate exchange — written by
+// installCertificates. bmc-pairing-manager reads TPM_TRUSTSTORE_CA_CERT_NV
+// from here.
+inline constexpr const char* ATTEST_TPM_TRUSTSTORE_CA_CERT_NV =
+    TPM_TRUSTSTORE_CA_CERT_NV;
+inline constexpr const char* ATTEST_TPM_SERVER_KEY_HANDLE =
+    TPM_SERVER_KEY_HANDLE;
+inline constexpr const char* ATTEST_TPM_SERVER_CERT_NV = TPM_SERVER_CERT_NV;
+inline constexpr const char* ATTEST_TPM_CLIENT_KEY_HANDLE =
+    TPM_CLIENT_KEY_HANDLE;
+inline constexpr const char* ATTEST_TPM_CLIENT_CERT_NV = TPM_CLIENT_CERT_NV;
+
 using ENTITY_DATA =
     std::tuple<const char*, std::string, std::string, std::string>;
 
@@ -111,7 +135,7 @@ inline bool saveCombinedCertAndKey(const X509Ptr& cert, const EVP_PKEYPtr& key,
                                    const std::string& filename)
 {
     openssl_ptr<BIO, BIO_free_all> combined_bio(BIO_new(BIO_s_mem()),
-                                                BIO_free_all);
+                                                &BIO_free_all);
 
     // Write certificate to BIO
     if (!PEM_write_bio_X509(combined_bio.get(), cert.get()))
@@ -147,7 +171,7 @@ std::optional<std::pair<X509Ptr, EVP_PKEYPtr>> createAndSaveEntityCertificate(
     int days_valid = CERT_MAX_VALIDITY_DAYS)
 {
     auto ca_name = openssl_ptr<X509_NAME, X509_NAME_free>(
-        X509_NAME_dup(X509_get_subject_name(ca.get())), X509_NAME_free);
+        X509_NAME_dup(X509_get_subject_name(ca.get())), &X509_NAME_free);
     auto [cert, key] =
         create_leaf_cert(ca_pkey.get(), ca_name.get(), common_name, days_valid);
     if (!cert || !key)
@@ -199,15 +223,503 @@ std::optional<std::pair<X509Ptr, EVP_PKEYPtr>> createAndSaveEntityCertificate(
               combined_filename);
     return std::make_optional(std::make_pair(std::move(cert), std::move(key)));
 }
+
+// Free function used by FileSystemCertStrategy (avoids forward-declaring
+// CertificateExchanger before its full definition).
+inline bool processInterMediateCACerts(
+    const openssl_ptr<EVP_PKEY, EVP_PKEY_free>& pkey,
+    const openssl_ptr<X509, X509_free>& ca, const std::string& hostName)
+{
+    if (!pkey)
+    {
+        LOG_ERROR("Failed to read private key from provided data");
+        return false;
+    }
+    if (!ca)
+    {
+        LOG_ERROR("Failed to read CA certificate from provided data");
+        return false;
+    }
+    std::array<ENTITY_DATA, 2> entityData = {
+        ENTITY_DATA{"clientAuth", CLIENT_PKEY_PATH(), ENTITY_CLIENT_CERT_PATH(),
+                    ENTITY_CLIENT_COMBINED_PATH()},
+        ENTITY_DATA{"serverAuth", SERVER_PKEY_PATH(), ENTITY_SERVER_CERT_PATH(),
+                    ENTITY_SERVER_COMBINED_PATH()}};
+    auto servCert =
+        createAndSaveEntityCertificate<2>(pkey, ca, hostName, entityData, 1);
+    if (!servCert)
+    {
+        LOG_ERROR("Failed to create server entity certificate");
+        return false;
+    }
+    auto clientCert =
+        createAndSaveEntityCertificate<2>(pkey, ca, "service", entityData, 0);
+    if (!clientCert)
+    {
+        LOG_ERROR("Failed to create client entity certificate");
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Certificate creation strategy interface
+// ---------------------------------------------------------------------------
+
+/** Abstract strategy for creating the local CA + entity certificates. */
+struct ICertificateStrategy
+{
+    virtual ~ICertificateStrategy() = default;
+    ICertificateStrategy() = default;
+    ICertificateStrategy(const ICertificateStrategy&) = default;
+    ICertificateStrategy& operator=(const ICertificateStrategy&) = default;
+    ICertificateStrategy(ICertificateStrategy&&) = default;
+    ICertificateStrategy& operator=(ICertificateStrategy&&) = default;
+
+    /**
+     * @brief Create/refresh the CA and entity certificates.
+     * @param hostName  Common-name used for the server entity certificate.
+     * @return The loaded CA X509 certificate on success, nullptr on failure.
+     */
+    virtual X509Ptr create(const std::string& hostName) = 0;
+};
+
+// ---------------------------------------------------------------------------
+// FileSystem strategy — existing behaviour, unchanged
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates certificates from PEM files on the filesystem (the original
+ * implementation).  The CA key lives at AUTHORITY_CA_KEY_PATH and entity
+ * certs are written to the standard SSL paths.
+ */
+struct FileSystemCertStrategy : ICertificateStrategy
+{
+    X509Ptr create(const std::string& hostName) override
+    {
+        if (!ensureCAInSslPaths())
+        {
+            LOG_ERROR("Failed to ensure CA is available in SSL paths");
+            return makeX509Ptr(nullptr);
+        }
+
+        auto caCert = loadCertificate(AUTHORITY_CA_CERT_PATH);
+        if (!caCert)
+        {
+            LOG_ERROR("Failed to load CA certificate from {}",
+                      AUTHORITY_CA_CERT_PATH);
+            return makeX509Ptr(nullptr);
+        }
+
+        auto caPkey = loadPrivateKey(AUTHORITY_CA_KEY_PATH);
+        if (!caPkey)
+        {
+            LOG_ERROR("Failed to load CA private key from {}",
+                      AUTHORITY_CA_KEY_PATH);
+            return makeX509Ptr(nullptr);
+        }
+
+        if (!processInterMediateCACerts(caPkey, caCert, hostName))
+        {
+            LOG_ERROR("Failed to process intermediate CA");
+            return makeX509Ptr(nullptr);
+        }
+        return caCert;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// TPM strategy — creates CA + entity certs backed by the TPM
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates certificates whose private keys are held inside the TPM.
+ *
+ * Simics mode: the provisioned CA (PROVISIONED_CA_CERT/KEY_PATH) signs the
+ * server and client entity certificates directly.  The provisioned CA cert is
+ * stored in both ATTEST_TPM_CA_CERT_NV and ATTEST_TPM_TRUSTSTORE_CA_CERT_NV.
+ *
+ * Non-Simics mode: a new self-signed CA is generated with a TPM key at
+ * ATTEST_TPM_CA_KEY_HANDLE and its cert stored at ATTEST_TPM_CA_CERT_NV.
+ * It signs the server and client entity certificates.
+ * ATTEST_TPM_TRUSTSTORE_CA_CERT_NV is left empty until a peer CA is
+ * installed by the certificate exchange.
+ *
+ * Entity keys/certs are placed at the handles and NV indices that match the
+ * constants used by ssl_functions.hpp (ATTEST_TPM_SERVER_* /
+ * ATTEST_TPM_CLIENT_*).
+ *
+ * After all TPM objects are created the CA cert is exported from TPM NV into
+ * the standard filesystem SSL paths so that the rest of the daemon (which
+ * calls ensureCAInSslPaths / loadCertificate) continues to work.
+ */
+struct TpmCertStrategy : ICertificateStrategy
+{
+    X509Ptr create(const std::string& hostName) override
+    {
+        auto& tpm = Tpm2CertManager::getInstance();
+        if (!tpm.isInitialized())
+        {
+            LOG_ERROR(
+                "TPM2 provider not initialized; cannot use TpmCertStrategy");
+            return makeX509Ptr(nullptr);
+        }
+
+        // ---------------------------------------------------------------
+        // If all three NV indices already hold valid certs, skip creation
+        // and return the CA cert directly.
+        // ---------------------------------------------------------------
+        if (allCertsPresent(tpm))
+        {
+            LOG_INFO(
+                "TPM certificate strategy: all certs already present, skipping creation");
+            return loadCaFromTpm();
+        }
+
+        const std::string entityName = hostName.empty() ? "bmc" : hostName;
+        const std::string serverSubject = std::format("/CN={}", entityName);
+        const std::string clientSubject =
+            std::format("/CN={}-client", entityName);
+
+        boost::system::error_code ec;
+        if (isSimics())
+        {
+            // -----------------------------------------------------------
+            // Simics: provisioned CA stored in the CA and trust-store NV
+            // slots; it signs both entity certs directly.
+            // -----------------------------------------------------------
+            LOG_INFO("Simics mode: using provisioned CA to sign entity certs");
+            ec = seedProvisionedCAIntoTPM(tpm);
+            if (ec)
+            {
+                LOG_ERROR("TPM: failed to seed provisioned CA: {}",
+                          ec.message());
+                return makeX509Ptr(nullptr);
+            }
+
+            ec = tpm.createEntityCertificateSignedByFilesystemCA(
+                ATTEST_TPM_SERVER_KEY_HANDLE, ATTEST_TPM_SERVER_CERT_NV,
+                serverSubject, PROVISIONED_CA_KEY_PATH,
+                PROVISIONED_CA_CERT_PATH, "v3_server");
+            if (ec)
+            {
+                LOG_ERROR("TPM: failed to create server entity certificate: {}",
+                          ec.message());
+                return makeX509Ptr(nullptr);
+            }
+
+            ec = tpm.createEntityCertificateSignedByFilesystemCA(
+                ATTEST_TPM_CLIENT_KEY_HANDLE, ATTEST_TPM_CLIENT_CERT_NV,
+                clientSubject, PROVISIONED_CA_KEY_PATH,
+                PROVISIONED_CA_CERT_PATH, "v3_client");
+            if (ec)
+            {
+                LOG_ERROR("TPM: failed to create client entity certificate: {}",
+                          ec.message());
+                return makeX509Ptr(nullptr);
+            }
+        }
+        else
+        {
+            // -----------------------------------------------------------
+            // Non-Simics: new self-signed CA in the TPM CA slot signs both
+            // entity certs.  The trust-store slot is not filled here.
+            // -----------------------------------------------------------
+            ec = tpm.createCACertificateInTPM(ATTEST_TPM_CA_KEY_HANDLE,
+                                              ATTEST_TPM_CA_CERT_NV,
+                                              "/CN=BMC-Attestation-CA", 3650);
+            if (ec)
+            {
+                LOG_ERROR("TPM: failed to create CA certificate: {}",
+                          ec.message());
+                return makeX509Ptr(nullptr);
+            }
+
+            ec = tpm.createEntityCertificateInTPM(
+                ATTEST_TPM_SERVER_KEY_HANDLE, ATTEST_TPM_SERVER_CERT_NV,
+                serverSubject, ATTEST_TPM_CA_KEY_HANDLE, ATTEST_TPM_CA_CERT_NV,
+                365, "v3_server");
+            if (ec)
+            {
+                LOG_ERROR("TPM: failed to create server entity certificate: {}",
+                          ec.message());
+                return makeX509Ptr(nullptr);
+            }
+
+            ec = tpm.createEntityCertificateInTPM(
+                ATTEST_TPM_CLIENT_KEY_HANDLE, ATTEST_TPM_CLIENT_CERT_NV,
+                clientSubject, ATTEST_TPM_CA_KEY_HANDLE, ATTEST_TPM_CA_CERT_NV,
+                365, "v3_client");
+            if (ec)
+            {
+                LOG_ERROR("TPM: failed to create client entity certificate: {}",
+                          ec.message());
+                return makeX509Ptr(nullptr);
+            }
+        }
+
+        LOG_INFO("TPM certificate strategy: CA + entity certs created in TPM");
+        return loadCaFromTpm();
+    }
+
+  private:
+    // Simics only: store the provisioned CA cert in the TPM CA slot
+    // (ATTEST_TPM_CA_CERT_NV) and the trust-store slot
+    // (ATTEST_TPM_TRUSTSTORE_CA_CERT_NV) so that mTLS connections succeed
+    // without requiring a live certificate exchange.
+    //
+    // Both BMCs in Simics share the same firmware image and therefore the same
+    // provisioned CA (/usr/share/attestation/ca.pem).  We exploit this to
+    // skip the exchange step: the peer's CA is already known.
+    //
+    // Steps:
+    //   0. Ensure /var/attestation/ca.* are present.
+    //   1. Store the provisioned CA cert in ATTEST_TPM_CA_CERT_NV.
+    //   2. Pre-populate the trust store (ATTEST_TPM_TRUSTSTORE_CA_CERT_NV and
+    //      CA_PATH()) with the provisioned CA cert so connections are verified
+    //      without a live exchange.
+    static boost::system::error_code seedProvisionedCAIntoTPM(
+        Tpm2CertManager& tpm)
+    {
+        // Step 0: seed /var/attestation/ca.* from defaults if not yet present.
+        if (!ensureCAInSslPaths())
+        {
+            LOG_ERROR(
+                "Simics CA seed: failed to ensure provisioned CA files in /var");
+            return boost::system::errc::make_error_code(
+                boost::system::errc::no_such_file_or_directory);
+        }
+
+        // Step 1: store the provisioned CA cert in the TPM CA slot.
+        auto ec = tpm.storeCertificateInTPMNV(PROVISIONED_CA_CERT_PATH,
+                                              ATTEST_TPM_CA_CERT_NV);
+        if (ec)
+        {
+            LOG_ERROR(
+                "Simics CA seed: failed to store provisioned CA in TPM NV {}: {}",
+                ATTEST_TPM_CA_CERT_NV, ec.message());
+            return ec;
+        }
+        LOG_INFO("Simics CA seed: provisioned CA stored in TPM NV {}",
+                 ATTEST_TPM_CA_CERT_NV);
+
+        // Step 2: pre-populate the trust store with the provisioned CA cert.
+        // Both Simics BMCs share the same provisioned CA, so we already know
+        // the peer's CA — no live exchange needed for connections to succeed.
+        // Inline the equivalent of CertificateExchanger::installCertificates
+        // (which is declared later in this file and cannot be called here).
+        auto caCert = loadCertificate(PROVISIONED_CA_CERT_PATH);
+        if (!caCert)
+        {
+            LOG_ERROR(
+                "Simics CA seed: failed to load provisioned CA cert for trust-store seeding");
+            return boost::system::errc::make_error_code(
+                boost::system::errc::no_such_file_or_directory);
+        }
+        // Write to the exchange CA path and create the hash symlink.
+        createCertDirectories();
+        if (!saveCertificate(CA_PATH(), caCert))
+        {
+            LOG_ERROR("Simics CA seed: failed to write CA to {}", CA_PATH());
+            return boost::system::errc::make_error_code(
+                boost::system::errc::io_error);
+        }
+        if (!createCertificateHashFile(caCert, CA_PATH()))
+        {
+            LOG_ERROR("Simics CA seed: failed to create hash file for {}",
+                      CA_PATH());
+            return boost::system::errc::make_error_code(
+                boost::system::errc::io_error);
+        }
+        // Store in TPM trust-store NV slot (0x01C10190).
+        ec = tpm.storeCertificateInTPMNV(CA_PATH(),
+                                         ATTEST_TPM_TRUSTSTORE_CA_CERT_NV);
+        if (ec)
+        {
+            LOG_ERROR(
+                "Simics CA seed: failed to store provisioned CA in TPM NV {}: {}",
+                ATTEST_TPM_TRUSTSTORE_CA_CERT_NV, ec.message());
+            return ec;
+        }
+        LOG_INFO("Simics CA seed: trust store pre-populated with provisioned CA"
+                 " (no exchange needed)");
+
+        return boost::system::error_code{};
+    }
+
+    // Returns true only when all three NV certs are readable AND the TPM
+    // private keys still match their stored certificates.  A NV-only check
+    // is insufficient: loadAndPersistTPMKey evicts and replaces the key at
+    // a handle atomically, so after a partial failure the NV cert can
+    // silently disagree with the key currently at the handle.
+    static bool allCertsPresent(Tpm2CertManager& tpm)
+    {
+        // 1. Check every cert NV index is readable.
+        X509Ptr probe(nullptr, &X509_free);
+        if (reactor::Tpm2CertManager::readCertificateFromTPMNV(
+                ATTEST_TPM_CA_CERT_NV, probe) ||
+            reactor::Tpm2CertManager::readCertificateFromTPMNV(
+                ATTEST_TPM_SERVER_CERT_NV, probe) ||
+            reactor::Tpm2CertManager::readCertificateFromTPMNV(
+                ATTEST_TPM_CLIENT_CERT_NV, probe))
+        {
+            LOG_DEBUG(
+                "TPM: one or more cert NV indices missing, will recreate");
+            return false;
+        }
+
+        // 2. Verify server key handle still matches its cert.
+        //    Build a throw-away SSL_CTX, load cert + key, call
+        //    SSL_CTX_check_private_key — this is the same check the TLS stack
+        //    does at handshake time.
+        X509Ptr serverCert(nullptr, &X509_free);
+        if (reactor::Tpm2CertManager::readCertificateFromTPMNV(
+                ATTEST_TPM_SERVER_CERT_NV, serverCert))
+        {
+            return false;
+        }
+        EVP_PKEYPtr serverKey(nullptr, &EVP_PKEY_free);
+        std::string keyUri =
+            std::format("handle:{}", ATTEST_TPM_SERVER_KEY_HANDLE);
+        if (tpm.loadPrivateKeyFromTpm(keyUri, serverKey))
+        {
+            LOG_DEBUG("TPM: server key handle {} not accessible, will recreate",
+                      ATTEST_TPM_SERVER_KEY_HANDLE);
+            return false;
+        }
+
+        // Use a temporary SSL_CTX to check key/cert consistency.
+        SSL_CTX* tmpCtx = SSL_CTX_new(TLS_server_method());
+        if (!tmpCtx)
+        {
+            return false;
+        }
+        bool consistent =
+            SSL_CTX_use_certificate(tmpCtx, serverCert.get()) == 1 &&
+            SSL_CTX_use_PrivateKey(tmpCtx, serverKey.get()) == 1 &&
+            SSL_CTX_check_private_key(tmpCtx) == 1;
+        SSL_CTX_free(tmpCtx);
+
+        if (!consistent)
+        {
+            LOG_WARNING(
+                "TPM: server key/cert mismatch detected, will recreate all certs");
+            // Suppress any OpenSSL errors from the failed check.
+            ERR_clear_error();
+        }
+        return consistent;
+    }
+
+    // Reads the CA cert from TPM NV, promotes it to AUTHORITY_CA_CERT_PATH,
+    // and returns it as an X509Ptr.
+    static X509Ptr loadCaFromTpm()
+    {
+        X509Ptr caCert(nullptr, &X509_free);
+        auto ec = reactor::Tpm2CertManager::readCertificateFromTPMNV(
+            ATTEST_TPM_CA_CERT_NV, caCert);
+        if (ec)
+        {
+            LOG_ERROR("TPM: failed to read CA cert from NV {}: {}",
+                      ATTEST_TPM_CA_CERT_NV, ec.message());
+            return makeX509Ptr(nullptr);
+        }
+
+        // Promote to filesystem path so the rest of the daemon can use it.
+        namespace fs = std::filesystem;
+        std::error_code fsEc;
+        fs::create_directories(fs::path(AUTHORITY_CA_CERT_PATH).parent_path(),
+                               fsEc);
+        if (fsEc)
+        {
+            LOG_ERROR("TPM: failed to create authority directory: {}",
+                      fsEc.message());
+            return makeX509Ptr(nullptr);
+        }
+
+        FilePtr fp = makeFilePtr(fopen(AUTHORITY_CA_CERT_PATH, "w"));
+        if (!fp || PEM_write_X509(fp.get(), caCert.get()) != 1)
+        {
+            LOG_ERROR("TPM: failed to write CA cert to {}",
+                      AUTHORITY_CA_CERT_PATH);
+            return makeX509Ptr(nullptr);
+        }
+
+        LOG_INFO("TPM CA cert promoted to {}", AUTHORITY_CA_CERT_PATH);
+        return caCert;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Factory: pick the right strategy at runtime
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a TpmCertStrategy when the TPM2 provider is available and
+ * initialised, otherwise falls back to FileSystemCertStrategy.
+ */
+inline std::unique_ptr<ICertificateStrategy> makeDefaultCertStrategy()
+{
+    auto& tpm = Tpm2CertManager::getInstance();
+    if (tpm.isInitialized())
+    {
+        LOG_INFO("Certificate strategy: TPM-backed");
+        return std::make_unique<TpmCertStrategy>();
+    }
+    LOG_INFO("Certificate strategy: filesystem (TPM not available)");
+    return std::make_unique<FileSystemCertStrategy>();
+}
+
+// ---------------------------------------------------------------------------
+// Load the already-created CA cert without regenerating any keys.
+// Uses TPM NV when the TPM2 provider is available, otherwise reads the
+// cert from AUTHORITY_CA_CERT_PATH on the filesystem.
+// ---------------------------------------------------------------------------
+inline X509Ptr loadCaCert()
+{
+    auto& tpm = Tpm2CertManager::getInstance();
+    if (tpm.isInitialized())
+    {
+        X509Ptr caCert(nullptr, &X509_free);
+        auto ec = reactor::Tpm2CertManager::readCertificateFromTPMNV(
+            ATTEST_TPM_CA_CERT_NV, caCert);
+        if (ec)
+        {
+            LOG_ERROR("loadCaCert: failed to read CA cert from TPM NV {}: {}",
+                      ATTEST_TPM_CA_CERT_NV, ec.message());
+            return makeX509Ptr(nullptr);
+        }
+        LOG_DEBUG("loadCaCert: loaded CA cert from TPM NV {}",
+                  ATTEST_TPM_CA_CERT_NV);
+        return caCert;
+    }
+
+    auto caCert = loadCertificate(AUTHORITY_CA_CERT_PATH);
+    if (!caCert)
+    {
+        LOG_ERROR("loadCaCert: failed to load CA cert from {}",
+                  AUTHORITY_CA_CERT_PATH);
+    }
+    return caCert;
+}
+
+// ---------------------------------------------------------------------------
+// CertificateExchanger
+// ---------------------------------------------------------------------------
+
 struct CertificateExchanger
 {
     EventQueue& eventQueue;
     net::io_context& ioContext;
-    X509Ptr mCaCert{nullptr, X509_free};
-    CertificateExchanger(EventQueue& eventQueue, net::io_context& ioContext) :
+    X509Ptr mCaCert{nullptr, &X509_free};
+
+    explicit CertificateExchanger(EventQueue& eventQueue,
+                                  net::io_context& ioContext) :
         eventQueue(eventQueue), ioContext(ioContext)
     {
-        mCaCert = createCertificates();
+        // Load the CA cert that was already created at startup.
+        // We never recreate keys here — doing so would invalidate the SSL
+        // context that bmc-pairing-manager built from the same TPM handles.
+        mCaCert = loadCaCert();
     }
     CertificateExchanger(const CertificateExchanger&) = delete;
     CertificateExchanger& operator=(const CertificateExchanger&) = delete;
@@ -252,48 +764,16 @@ struct CertificateExchanger
         const openssl_ptr<EVP_PKEY, EVP_PKEY_free>& pkey,
         const openssl_ptr<X509, X509_free>& ca, const std::string& hostName)
     {
-        if (!pkey)
-        {
-            LOG_ERROR("Failed to read private key from provided data");
-            return false;
-        }
-        if (!ca)
-        {
-            LOG_ERROR("Failed to read CA certificate from provided data");
-            return false;
-        }
-        std::array<ENTITY_DATA, 2> entity_data = {
-            ENTITY_DATA{"clientAuth", CLIENT_PKEY_PATH(),
-                        ENTITY_CLIENT_CERT_PATH(),
-                        ENTITY_CLIENT_COMBINED_PATH()},
-            ENTITY_DATA{"serverAuth", SERVER_PKEY_PATH(),
-                        ENTITY_SERVER_CERT_PATH(),
-                        ENTITY_SERVER_COMBINED_PATH()}};
-        auto caname = openssl_ptr<X509_NAME, X509_NAME_free>(
-            X509_NAME_dup(X509_get_subject_name(ca.get())), X509_NAME_free);
-        auto servCert = createAndSaveEntityCertificate<2>(pkey, ca, hostName,
-                                                          entity_data, 1);
-        if (!servCert)
-        {
-            LOG_ERROR("Failed to create server entity certificate");
-            return false;
-        }
-        auto clientCert = createAndSaveEntityCertificate<2>(pkey, ca, "service",
-                                                            entity_data, 0);
-        if (!clientCert)
-        {
-            LOG_ERROR("Failed to create client entity certificate");
-            return false;
-        }
-        return true;
+        return processInterMediateCACerts(pkey, ca, hostName);
     }
     static bool installCertificates(const std::string& castr)
     {
         openssl_ptr<BIO, BIO_free_all> bio(
             BIO_new_mem_buf(castr.data(), static_cast<int>(castr.size())),
-            BIO_free_all);
+            &BIO_free_all);
         openssl_ptr<X509, X509_free> ca(
-            PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr), X509_free);
+            PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr),
+            &X509_free);
 
         if (!saveCertificate(CA_PATH(), ca))
         {
@@ -323,39 +803,31 @@ struct CertificateExchanger
         LOG_DEBUG(
             "Certificate hash file created and trust store verified for {}",
             trustStoreDir);
+
+        // Store the peer CA in TPM NV so bmc-pairing-manager can build a
+        // TPM-backed SSL context using TPM_TRUSTSTORE_CA_CERT_NV (0x1500002).
+        auto& tpm = Tpm2CertManager::getInstance();
+        if (tpm.isInitialized())
+        {
+            auto ec = tpm.storeCertificateInTPMNV(
+                CA_PATH(), ATTEST_TPM_TRUSTSTORE_CA_CERT_NV);
+            if (ec)
+            {
+                LOG_WARNING("Failed to store peer CA in TPM NV {}: {} — "
+                            "TPM SSL context will be unavailable",
+                            ATTEST_TPM_TRUSTSTORE_CA_CERT_NV, ec.message());
+            }
+            else
+            {
+                LOG_INFO("Peer CA stored in TPM NV {}",
+                         ATTEST_TPM_TRUSTSTORE_CA_CERT_NV);
+            }
+        }
+
         return true;
-    }
-    static X509Ptr createCertificates(const std::string& hostName = {})
-    {
-        if (fs::exists(SELF_CA_PATH()))
-        {
-            return loadCertificate(SELF_CA_PATH());
-        }
-        auto [ca_cert, ca_pkey] = create_ca_cert(nullptr, nullptr, "BMC CA");
-        if (!ca_cert || !ca_pkey)
-        {
-            LOG_ERROR("Failed to create CA certificate and private key");
-            return makeX509Ptr(nullptr);
-        }
-        if (!processInterMediateCA(ca_pkey, ca_cert, hostName))
-        {
-            LOG_ERROR("Failed to process intermediate CA");
-            return makeX509Ptr(nullptr);
-        }
-        if (!saveCertificate(SELF_CA_PATH(), ca_cert))
-        {
-            LOG_ERROR("Failed to save entity certificate to {}",
-                      SELF_CA_PATH());
-            return makeX509Ptr(nullptr);
-        }
-        return std::move(ca_cert);
     }
     net::awaitable<bool> sendCertificate(Streamer streamer)
     {
-        if (!mCaCert)
-        {
-            mCaCert = createCertificates();
-        }
         if (!mCaCert)
         {
             co_return false;

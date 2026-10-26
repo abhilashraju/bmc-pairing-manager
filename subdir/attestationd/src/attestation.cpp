@@ -213,7 +213,7 @@ int main(int argc, const char* argv[])
         auto maxConnections = 1;
 
         auto& logger = reactor::getLogger();
-        logger.setLogLevel(reactor::LogLevel::WARNING);
+        logger.setLogLevel(reactor::LogLevel::INFO);
         net::io_context io_context;
         if (!ensureCertificates(servercert, self_signed))
         {
@@ -236,7 +236,7 @@ int main(int argc, const char* argv[])
             LOG_ERROR("Failed to load signing certificate from {}", signcert);
             return 1;
         }
-        CertificateExchanger::createCertificates("bmc.peer");
+        makeDefaultCertStrategy()->create("bmc.peer");
         AttestationHandler attestationHandler(
             MeasurementTaker(loadPrivateKey(signprivkey)),
             MeasurementVerifier(getPublicKeyFromCert(verifyCert)), eventQueue,
@@ -280,6 +280,20 @@ int main(int argc, const char* argv[])
                       makeNeighbourUpdateHandler(conn, iface, neighbourHandler),
                       net::detached);
         conn->request_name(AttestationDeviceIface::busName);
+
+        // In Simics mode all TPM certs are seeded at startup (no handshake
+        // needed).  Emit the Attested signal immediately so bmc-pairing-manager
+        // can build its SSL context and start listening without waiting for a
+        // real attestation exchange.
+        if (isSimics())
+        {
+            net::post(io_context, [&attestationResponder]() {
+                LOG_INFO(
+                    "Simics mode: emitting Attested signal (certs pre-seeded)");
+                attestationResponder.emitStatus(true);
+            });
+        }
+
         io_context.run();
     }
     catch (const std::exception& e)
