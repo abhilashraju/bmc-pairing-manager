@@ -10,6 +10,7 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#include <fstream>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -266,7 +267,7 @@ inline bool processInterMediateCACerts(
 // Certificate creation strategy interface
 // ---------------------------------------------------------------------------
 
-/** Abstract strategy for creating the local CA + entity certificates. */
+/** Abstract strategy for creating/installing/loading the CA + entity certs. */
 struct ICertificateStrategy
 {
     virtual ~ICertificateStrategy() = default;
@@ -282,6 +283,20 @@ struct ICertificateStrategy
      * @return The loaded CA X509 certificate on success, nullptr on failure.
      */
     virtual X509Ptr create(const std::string& hostName) = 0;
+
+    /**
+     * @brief Install the peer CA received during certificate exchange.
+     * @param castr  PEM encoded peer CA certificate.
+     * @return true on success.
+     */
+    virtual bool install(const std::string& castr) = 0;
+
+    /**
+     * @brief Load the already-created local CA cert without regenerating
+     *        any keys.
+     * @return The CA X509 certificate on success, nullptr on failure.
+     */
+    virtual X509Ptr loadCa() = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -295,9 +310,64 @@ struct ICertificateStrategy
  */
 struct FileSystemCertStrategy : ICertificateStrategy
 {
+    bool install(const std::string& castr) override
+    {
+        openssl_ptr<BIO, BIO_free_all> bio(
+            BIO_new_mem_buf(castr.data(), static_cast<int>(castr.size())),
+            &BIO_free_all);
+        openssl_ptr<X509, X509_free> ca(
+            PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr),
+            &X509_free);
+
+        if (!saveCertificate(CA_PATH(), ca))
+        {
+            LOG_ERROR("Failed to save CA certificate to {}", CA_PATH());
+            return false;
+        }
+        LOG_DEBUG("CA Certificates written to {} ", CA_PATH());
+
+        // Create certificate hash file for trust store usage
+        if (!createCertificateHashFile(ca, CA_PATH()))
+        {
+            LOG_ERROR("Failed to create certificate hash file for {}",
+                      CA_PATH());
+            return false;
+        }
+
+        // Verify that the directory can be used as a trust store path
+        std::filesystem::path caPath(CA_PATH());
+        std::string trustStoreDir = caPath.parent_path().string();
+        if (!verifyTrustStorePath(trustStoreDir))
+        {
+            LOG_ERROR("Trust store directory verification failed: {}",
+                      trustStoreDir);
+            return false;
+        }
+
+        LOG_DEBUG(
+            "Certificate hash file created and trust store verified for {}",
+            trustStoreDir);
+        return true;
+    }
+
+    X509Ptr loadCa() override
+    {
+        auto caCert = loadCertificate(AUTHORITY_CA_CERT_PATH);
+        if (!caCert)
+        {
+            LOG_ERROR("loadCa: failed to load CA cert from {}",
+                      AUTHORITY_CA_CERT_PATH);
+        }
+        return caCert;
+    }
+
     X509Ptr create(const std::string& hostName) override
     {
-        if (!ensureCAInSslPaths())
+        // Simics: every BMC shares the CA shipped in the image.
+        // Device: every BMC owns a unique self-signed CA.
+        const bool caReady =
+            isSimics() ? seedCAIntoSslPaths() : generateSelfSignedCA();
+        if (!caReady || !publishCA())
         {
             LOG_ERROR("Failed to ensure CA is available in SSL paths");
             return makeX509Ptr(nullptr);
@@ -326,6 +396,169 @@ struct FileSystemCertStrategy : ICertificateStrategy
         }
         return caCert;
     }
+
+  private:
+    static bool createAuthorityDirectories()
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::create_directories(fs::path(AUTHORITY_CA_CERT_PATH).parent_path(),
+                               ec);
+        if (ec)
+        {
+            LOG_ERROR("Failed to create authority directory: {}", ec.message());
+            return false;
+        }
+        fs::create_directories(fs::path(AUTHORITY_CA_KEY_PATH).parent_path(),
+                               ec);
+        if (ec)
+        {
+            LOG_ERROR("Failed to create private key directory: {}",
+                      ec.message());
+            return false;
+        }
+        fs::create_directories(
+            fs::path(std::format(SELF_CA_PATH_X, "/")).parent_path(), ec);
+        if (ec)
+        {
+            LOG_ERROR("Failed to create certs directory: {}", ec.message());
+            return false;
+        }
+        return true;
+    }
+
+    // Simics only, on every startup:
+    //   1. Seed /var/attestation/ca.* from the image defaults.
+    //   2. Copy /var/attestation/ca.* into /etc/ssl paths (wiped on each
+    //      reflash).
+    static bool seedCAIntoSslPaths()
+    {
+        namespace fs = std::filesystem;
+
+        if (!seedProvisionedCA() || !createAuthorityDirectories())
+        {
+            return false;
+        }
+
+        if (!copyFile(PROVISIONED_CA_CERT_PATH, AUTHORITY_CA_CERT_PATH,
+                      fs::perms::owner_read | fs::perms::owner_write |
+                          fs::perms::group_read | fs::perms::others_read))
+        {
+            return false;
+        }
+        LOG_INFO("CA certificate promoted to {}", AUTHORITY_CA_CERT_PATH);
+
+        if (!copyFile(PROVISIONED_CA_KEY_PATH, AUTHORITY_CA_KEY_PATH,
+                      fs::perms::owner_read | fs::perms::owner_write))
+        {
+            return false;
+        }
+        LOG_INFO("CA private key promoted to {}", AUTHORITY_CA_KEY_PATH);
+        return true;
+    }
+
+    // Device only: generate a unique self-signed CA for this BMC.  An existing
+    // CA/key pair is reused so the CA already given to the peer stays valid
+    // across restarts; /etc is wiped on reflash, which yields a new CA.
+    static bool generateSelfSignedCA()
+    {
+        namespace fs = std::filesystem;
+
+        if (!createAuthorityDirectories())
+        {
+            return false;
+        }
+
+        if (fs::exists(AUTHORITY_CA_CERT_PATH) &&
+            fs::exists(AUTHORITY_CA_KEY_PATH) &&
+            loadCertificate(AUTHORITY_CA_CERT_PATH) &&
+            loadPrivateKey(AUTHORITY_CA_KEY_PATH))
+        {
+            LOG_INFO("Reusing existing self-signed CA at {}",
+                     AUTHORITY_CA_CERT_PATH);
+            return true;
+        }
+
+        auto [ca,
+              pkey] = create_ca_cert(nullptr, nullptr, "BMC Attestation CA");
+        if (!ca || !pkey)
+        {
+            LOG_ERROR("Failed to generate self-signed CA certificate");
+            return false;
+        }
+        if (!saveCertificate(AUTHORITY_CA_CERT_PATH, ca) ||
+            !savePrivateKey(AUTHORITY_CA_KEY_PATH, pkey))
+        {
+            LOG_ERROR("Failed to save self-signed CA to {} / {}",
+                      AUTHORITY_CA_CERT_PATH, AUTHORITY_CA_KEY_PATH);
+            return false;
+        }
+        std::error_code ec;
+        fs::permissions(AUTHORITY_CA_CERT_PATH,
+                        fs::perms::owner_read | fs::perms::owner_write |
+                            fs::perms::group_read | fs::perms::others_read,
+                        ec);
+        fs::permissions(AUTHORITY_CA_KEY_PATH,
+                        fs::perms::owner_read | fs::perms::owner_write, ec);
+        LOG_INFO("Generated unique self-signed CA at {}",
+                 AUTHORITY_CA_CERT_PATH);
+        return true;
+    }
+
+    // Common to both modes, once the CA exists at AUTHORITY_CA_*_PATH:
+    //   1. Place a copy of the CA cert at the exchange path (self_ca.pem).
+    //   2. Create the OpenSSL hash symlink in the authority directory.
+    static bool publishCA()
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+
+        const std::string selfCaPath = std::format(SELF_CA_PATH_X, "/");
+        if (!copyFile(AUTHORITY_CA_CERT_PATH, selfCaPath,
+                      fs::perms::owner_read | fs::perms::owner_write |
+                          fs::perms::group_read | fs::perms::others_read))
+        {
+            return false;
+        }
+        LOG_INFO("CA certificate copy placed at {}", selfCaPath);
+
+        // Create OpenSSL hash symlink in the authority directory so that
+        // SSL_CTX_set_verify_path / add_verify_path can resolve the CA.
+        auto ca = loadCertificate(AUTHORITY_CA_CERT_PATH);
+        if (!ca)
+        {
+            LOG_ERROR("Failed to load CA cert for hash link generation");
+            return false;
+        }
+        unsigned long hash = X509_subject_name_hash(ca.get());
+        std::ostringstream oss;
+        oss << std::hex << std::setw(8) << std::setfill('0') << hash;
+        const fs::path authorityDir =
+            fs::path(AUTHORITY_CA_CERT_PATH).parent_path();
+        // Find first free index.
+        int idx = 0;
+        fs::path hashLink;
+        do
+        {
+            hashLink = authorityDir / (oss.str() + "." + std::to_string(idx));
+            idx++;
+        } while (fs::exists(hashLink) && idx < 100);
+
+        if (!fs::exists(hashLink))
+        {
+            fs::create_symlink(fs::path(AUTHORITY_CA_CERT_PATH).filename(),
+                               hashLink, ec);
+            if (ec)
+            {
+                LOG_ERROR("Failed to create hash symlink {}: {}",
+                          hashLink.string(), ec.message());
+                return false;
+            }
+            LOG_INFO("Created trust-store hash symlink {}", hashLink.string());
+        }
+
+        return true;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -351,10 +584,65 @@ struct FileSystemCertStrategy : ICertificateStrategy
  *
  * After all TPM objects are created the CA cert is exported from TPM NV into
  * the standard filesystem SSL paths so that the rest of the daemon (which
- * calls ensureCAInSslPaths / loadCertificate) continues to work.
+ * calls loadCertificate) continues to work.
  */
 struct TpmCertStrategy : ICertificateStrategy
 {
+    // The peer CA is stored only in TPM NV (TPM_TRUSTSTORE_CA_CERT_NV), which
+    // is where bmc-pairing-manager reads its trust store from.  Nothing is
+    // installed in the filesystem trust store.
+    bool install(const std::string& castr) override
+    {
+        auto& tpm = Tpm2CertManager::getInstance();
+        if (!tpm.isInitialized())
+        {
+            LOG_ERROR("TPM2 provider not initialized; cannot install peer CA");
+            return false;
+        }
+
+        // storeCertificateInTPMNV takes a file path; stage the PEM in a
+        // private (0700) temp directory that is removed on scope exit.
+        Tpm2CertManager::TempDir td;
+        const std::string tmpCa = td.path("peer_ca.pem");
+        {
+            std::ofstream out(tmpCa, std::ios::binary | std::ios::trunc);
+            out << castr;
+            if (!out)
+            {
+                LOG_ERROR("Failed to stage peer CA for TPM NV storage");
+                return false;
+            }
+        }
+
+        auto ec = tpm.storeCertificateInTPMNV(tmpCa,
+                                              ATTEST_TPM_TRUSTSTORE_CA_CERT_NV);
+        if (ec)
+        {
+            LOG_ERROR("Failed to store peer CA in TPM NV {}: {}",
+                      ATTEST_TPM_TRUSTSTORE_CA_CERT_NV, ec.message());
+            return false;
+        }
+        LOG_INFO("Peer CA stored in TPM NV {}",
+                 ATTEST_TPM_TRUSTSTORE_CA_CERT_NV);
+        return true;
+    }
+
+    X509Ptr loadCa() override
+    {
+        X509Ptr caCert(nullptr, &X509_free);
+        auto ec = reactor::Tpm2CertManager::readCertificateFromTPMNV(
+            ATTEST_TPM_CA_CERT_NV, caCert);
+        if (ec)
+        {
+            LOG_ERROR("loadCa: failed to read CA cert from TPM NV {}: {}",
+                      ATTEST_TPM_CA_CERT_NV, ec.message());
+            return makeX509Ptr(nullptr);
+        }
+        LOG_DEBUG("loadCa: loaded CA cert from TPM NV {}",
+                  ATTEST_TPM_CA_CERT_NV);
+        return caCert;
+    }
+
     X509Ptr create(const std::string& hostName) override
     {
         auto& tpm = Tpm2CertManager::getInstance();
@@ -481,8 +769,8 @@ struct TpmCertStrategy : ICertificateStrategy
     static boost::system::error_code seedProvisionedCAIntoTPM(
         Tpm2CertManager& tpm)
     {
-        // Step 0: seed /var/attestation/ca.* from defaults if not yet present.
-        if (!ensureCAInSslPaths())
+        // Step 0: seed /var/attestation/ca.* from the image defaults.
+        if (!seedProvisionedCA())
         {
             LOG_ERROR(
                 "Simics CA seed: failed to ensure provisioned CA files in /var");
@@ -650,56 +938,18 @@ struct TpmCertStrategy : ICertificateStrategy
 };
 
 // ---------------------------------------------------------------------------
-// Factory: pick the right strategy at runtime
+// Compile-time strategy selection: USE_TPM_CERTIFICATE selects the TPM
+// strategy, otherwise the filesystem strategy is used.
 // ---------------------------------------------------------------------------
+#ifdef USE_TPM_CERTIFICATE
+using DefaultCertStrategy = TpmCertStrategy;
+#else
+using DefaultCertStrategy = FileSystemCertStrategy;
+#endif
 
-/**
- * Returns a TpmCertStrategy when the TPM2 provider is available and
- * initialised, otherwise falls back to FileSystemCertStrategy.
- */
 inline std::unique_ptr<ICertificateStrategy> makeDefaultCertStrategy()
 {
-    auto& tpm = Tpm2CertManager::getInstance();
-    if (tpm.isInitialized())
-    {
-        LOG_INFO("Certificate strategy: TPM-backed");
-        return std::make_unique<TpmCertStrategy>();
-    }
-    LOG_INFO("Certificate strategy: filesystem (TPM not available)");
-    return std::make_unique<FileSystemCertStrategy>();
-}
-
-// ---------------------------------------------------------------------------
-// Load the already-created CA cert without regenerating any keys.
-// Uses TPM NV when the TPM2 provider is available, otherwise reads the
-// cert from AUTHORITY_CA_CERT_PATH on the filesystem.
-// ---------------------------------------------------------------------------
-inline X509Ptr loadCaCert()
-{
-    auto& tpm = Tpm2CertManager::getInstance();
-    if (tpm.isInitialized())
-    {
-        X509Ptr caCert(nullptr, &X509_free);
-        auto ec = reactor::Tpm2CertManager::readCertificateFromTPMNV(
-            ATTEST_TPM_CA_CERT_NV, caCert);
-        if (ec)
-        {
-            LOG_ERROR("loadCaCert: failed to read CA cert from TPM NV {}: {}",
-                      ATTEST_TPM_CA_CERT_NV, ec.message());
-            return makeX509Ptr(nullptr);
-        }
-        LOG_DEBUG("loadCaCert: loaded CA cert from TPM NV {}",
-                  ATTEST_TPM_CA_CERT_NV);
-        return caCert;
-    }
-
-    auto caCert = loadCertificate(AUTHORITY_CA_CERT_PATH);
-    if (!caCert)
-    {
-        LOG_ERROR("loadCaCert: failed to load CA cert from {}",
-                  AUTHORITY_CA_CERT_PATH);
-    }
-    return caCert;
+    return std::make_unique<DefaultCertStrategy>();
 }
 
 // ---------------------------------------------------------------------------
@@ -719,7 +969,7 @@ struct CertificateExchanger
         // Load the CA cert that was already created at startup.
         // We never recreate keys here — doing so would invalidate the SSL
         // context that bmc-pairing-manager built from the same TPM handles.
-        mCaCert = loadCaCert();
+        mCaCert = makeDefaultCertStrategy()->loadCa();
     }
     CertificateExchanger(const CertificateExchanger&) = delete;
     CertificateExchanger& operator=(const CertificateExchanger&) = delete;
@@ -768,63 +1018,7 @@ struct CertificateExchanger
     }
     static bool installCertificates(const std::string& castr)
     {
-        openssl_ptr<BIO, BIO_free_all> bio(
-            BIO_new_mem_buf(castr.data(), static_cast<int>(castr.size())),
-            &BIO_free_all);
-        openssl_ptr<X509, X509_free> ca(
-            PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr),
-            &X509_free);
-
-        if (!saveCertificate(CA_PATH(), ca))
-        {
-            LOG_ERROR("Failed to save CA certificate to {}", CA_PATH());
-            return false;
-        }
-        LOG_DEBUG("CA Certificates written to {} ", CA_PATH());
-
-        // Create certificate hash file for trust store usage
-        if (!createCertificateHashFile(ca, CA_PATH()))
-        {
-            LOG_ERROR("Failed to create certificate hash file for {}",
-                      CA_PATH());
-            return false;
-        }
-
-        // Verify that the directory can be used as a trust store path
-        std::filesystem::path caPath(CA_PATH());
-        std::string trustStoreDir = caPath.parent_path().string();
-        if (!verifyTrustStorePath(trustStoreDir))
-        {
-            LOG_ERROR("Trust store directory verification failed: {}",
-                      trustStoreDir);
-            return false;
-        }
-
-        LOG_DEBUG(
-            "Certificate hash file created and trust store verified for {}",
-            trustStoreDir);
-
-        // Store the peer CA in TPM NV so bmc-pairing-manager can build a
-        // TPM-backed SSL context using TPM_TRUSTSTORE_CA_CERT_NV (0x1500002).
-        auto& tpm = Tpm2CertManager::getInstance();
-        if (tpm.isInitialized())
-        {
-            auto ec = tpm.storeCertificateInTPMNV(
-                CA_PATH(), ATTEST_TPM_TRUSTSTORE_CA_CERT_NV);
-            if (ec)
-            {
-                LOG_WARNING("Failed to store peer CA in TPM NV {}: {} — "
-                            "TPM SSL context will be unavailable",
-                            ATTEST_TPM_TRUSTSTORE_CA_CERT_NV, ec.message());
-            }
-            else
-            {
-                LOG_INFO("Peer CA stored in TPM NV {}",
-                         ATTEST_TPM_TRUSTSTORE_CA_CERT_NV);
-            }
-        }
-
-        return true;
+        return makeDefaultCertStrategy()->install(castr);
     }
     net::awaitable<bool> sendCertificate(Streamer streamer)
     {
