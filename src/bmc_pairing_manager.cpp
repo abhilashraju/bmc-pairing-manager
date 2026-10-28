@@ -142,7 +142,7 @@ net::awaitable<bool> monitorBmc(
         {
             continue; // Timeout, continue reading
         }
-        LOG_INFO("Received from BMC: {}", *message);
+        LOG_DEBUG("Received from BMC: {}", *message);
         if (needping)
         {
             if (!co_await writePing(client))
@@ -187,14 +187,14 @@ net::awaitable<boost::system::error_code> connect(
     co_return boost::system::error_code{};
 }
 net::awaitable<void> tryConnect(
-    std::reference_wrapper<net::io_context> io_context, std::string ip,
+    std::reference_wrapper<net::io_context> io_context, std::string /*ip*/,
     short port, std::reference_wrapper<BmcPairingManagerObject> controller)
 {
     auto dir = BmcPairingManagerObject::ConnectionDirection::outgoing;
     controller.get().setPeerConnected(
         BmcPairingIface::PeerConnectionStatus::InProgress, dir);
     LOG_DEBUG("Trying peer connection");
-    auto sslCtx = getClientContext();
+    auto sslCtx = getClientContextWithFallback();
 
     if (!sslCtx)
     {
@@ -204,7 +204,7 @@ net::awaitable<void> tryConnect(
         co_return;
     }
     TcpClient client(io_context.get().get_executor(), *sslCtx);
-    auto ec = co_await connect(std::ref(client), ip, port);
+    auto ec = co_await connect(std::ref(client), "bmc.peer", port);
 
     if (ec)
     {
@@ -273,7 +273,7 @@ net::awaitable<void> onSpdmStateChange(
             bmcResponder.get().reset();
         }
 
-        auto sslContext = getServerContext();
+        auto sslContext = getServerContextWithFallback();
         if (!sslContext)
         {
             LOG_ERROR("ssl context is not available");
@@ -290,7 +290,7 @@ net::awaitable<void> startSpdm(
     std::shared_ptr<sdbusplus::asio::connection> conn,
     std::reference_wrapper<net::io_context> ioc, short port, std::string iface,
     std::reference_wrapper<BmcPairingManagerObject> controller,
-    std::reference_wrapper<std::shared_ptr<BmcResponder>> /*bmcResponder*/,
+    std::reference_wrapper<std::shared_ptr<BmcResponder>> bmcResponder,
     std::string deviceName)
 {
     try
@@ -316,6 +316,27 @@ net::awaitable<void> startSpdm(
 
         if (val && *val)
         {
+            LOG_INFO("SPDM pairing completed successfully (requester)");
+            co_await controller.get().setPaired(true);
+
+            // Rebuild the server context now that the peer CA is available
+            // in TPM NV (written by installCertificates during cert exchange).
+            if (bmcResponder.get())
+            {
+                LOG_INFO("Closing existing BMC responder before recreating");
+                bmcResponder.get().reset();
+            }
+            auto sslContext = getServerContextWithFallback();
+            if (!sslContext)
+            {
+                LOG_ERROR("ssl context is not available after SPDM pairing");
+            }
+            else
+            {
+                bmcResponder.get() = makeBmcResponder(
+                    ioc.get(), std::move(*sslContext), port, controller.get());
+            }
+
             auto ip = co_await getRemoteIp(*conn, iface);
             if (ip)
             {
@@ -396,7 +417,7 @@ std::shared_ptr<BmcResponder> initializeResponder(
     net::io_context& io_context, short port,
     BmcPairingManagerObject& controller)
 {
-    auto sslCtx = getServerContext();
+    auto sslCtx = getServerContextWithFallback();
     if (!sslCtx)
     {
         LOG_WARNING("SSL context unavailable, responder not initialized");
@@ -492,8 +513,13 @@ int main(int argc, const char* argv[])
     try
     {
         auto& logger = getLogger();
-        logger.setLogLevel(LogLevel::WARNING);
+        logger.setLogLevel(LogLevel::INFO);
+#ifdef USE_TPM_CERTIFICATE
+        // Only load the tpm2 provider for TPM builds.  Explicitly loading any
+        // provider disables OpenSSL's implicit "default" provider, which
+        // leaves non-TPM builds with no ciphers (SSL_CTX_new fails).
         Tpm2::getInstance(); // Initialize TPM2 provider
+#endif
         net::io_context io_context;
 
         auto config = loadAndValidateConfig(std::string(conf.value()));

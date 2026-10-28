@@ -29,8 +29,15 @@ option(
 option('tests', type: 'feature', description: 'Build unit tests', value: 'auto')
 
 option(
-    'use_filesystem_strategy',
+    'use_pic_controller',
     type: 'boolean',
-    description: 'Use FileSystemStrategy for persistence; default uses I2CStrategy',
+    description: 'Use I2CStrategy for persistence; default uses FileSystemStrategy',
+    value: false,
+)
+
+option(
+    'use_tpm_certificate',
+    type: 'boolean',
+    description: 'Use TPM-backed certificates and SSL contexts; default uses filesystem PEM files',
     value: false,
 )

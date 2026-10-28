@@ -95,7 +95,7 @@ struct BmcResponder
                 co_return;
             }
 
-            LOG_INFO("Received: {}", std::string(data.data(), bytes));
+            LOG_DEBUG("Received: {}", std::string(data.data(), bytes));
             std::string response = "alive";
             std::tie(ec, bytes) =
                 co_await streamer.write(net::buffer(response), true);
