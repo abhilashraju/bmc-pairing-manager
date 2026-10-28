@@ -18,7 +18,7 @@ constexpr auto DEFAULT_CA_KEY_PATH = "/usr/share/attestation/ca.key";
 constexpr auto PROVISIONED_CA_CERT_PATH = "/var/attestation/ca.pem";
 constexpr auto PROVISIONED_CA_KEY_PATH = "/var/attestation/ca.key";
 
-// Runtime SSL paths — populated by ensureCAInSslPaths() on every boot.
+// Runtime SSL paths — populated by FileSystemCertStrategy on every boot.
 constexpr auto AUTHORITY_CA_CERT_PATH = "/etc/ssl/certs/authority/ca.pem";
 constexpr auto AUTHORITY_CA_KEY_PATH = "/etc/ssl/private/ca.key";
 
@@ -102,20 +102,17 @@ inline bool copyFile(const std::string& src, const std::string& dst,
 inline bool isSimics()
 {
     // return std::filesystem::exists("/host");
-    return false;
+    return true;
 }
 
-// On every startup:
-//   1. Always seed /var/attestation/ca.* from /usr/share/attestation/
-//      (default shipped in the firmware image), overwriting any previous copy
-//      so every BMC running the same image uses the same CA.
-//   2. Copy /var/attestation/ca.* into /etc/ssl paths (wiped on each reflash).
-//   3. Create the OpenSSL hash symlink in the authority directory.
-inline bool ensureCAInSslPaths()
+// Always seed /var/attestation/ca.* from /usr/share/attestation/ (default
+// shipped in the firmware image), overwriting any previous copy so every BMC
+// running the same image uses the same CA.  Shared by all cert strategies;
+// each strategy does its own further seeding on top of this.
+inline bool seedProvisionedCA()
 {
     namespace fs = std::filesystem;
 
-    // --- Step 1: always seed /var from /usr/share, overwriting any copy ---
     if (!fs::exists(DEFAULT_CA_CERT_PATH))
     {
         LOG_ERROR("Default CA certificate not found at {}",
@@ -141,90 +138,6 @@ inline bool ensureCAInSslPaths()
         return false;
     }
     LOG_INFO("CA seeded into /var/attestation from image defaults");
-
-    // --- Step 2: promote /var → /etc/ssl (always, since /etc is wiped on
-    // reflash) ---
-    std::error_code ec;
-    fs::create_directories(fs::path(AUTHORITY_CA_CERT_PATH).parent_path(), ec);
-    if (ec)
-    {
-        LOG_ERROR("Failed to create authority directory: {}", ec.message());
-        return false;
-    }
-    fs::create_directories(fs::path(AUTHORITY_CA_KEY_PATH).parent_path(), ec);
-    if (ec)
-    {
-        LOG_ERROR("Failed to create private key directory: {}", ec.message());
-        return false;
-    }
-    fs::create_directories(
-        fs::path(std::format(SELF_CA_PATH_X, "/")).parent_path(), ec);
-    if (ec)
-    {
-        LOG_ERROR("Failed to create certs directory: {}", ec.message());
-        return false;
-    }
-
-    if (!copyFile(PROVISIONED_CA_CERT_PATH, AUTHORITY_CA_CERT_PATH,
-                  fs::perms::owner_read | fs::perms::owner_write |
-                      fs::perms::group_read | fs::perms::others_read))
-    {
-        return false;
-    }
-    LOG_INFO("CA certificate promoted to {}", AUTHORITY_CA_CERT_PATH);
-
-    if (!copyFile(PROVISIONED_CA_KEY_PATH, AUTHORITY_CA_KEY_PATH,
-                  fs::perms::owner_read | fs::perms::owner_write))
-    {
-        return false;
-    }
-    LOG_INFO("CA private key promoted to {}", AUTHORITY_CA_KEY_PATH);
-
-    // Copy cert to /etc/ssl/certs/self_ca.pem (exchange path).
-    const std::string selfCaPath = std::format(SELF_CA_PATH_X, "/");
-    if (!copyFile(PROVISIONED_CA_CERT_PATH, selfCaPath,
-                  fs::perms::owner_read | fs::perms::owner_write |
-                      fs::perms::group_read | fs::perms::others_read))
-    {
-        return false;
-    }
-    LOG_INFO("CA certificate copy placed at {}", selfCaPath);
-
-    // Create OpenSSL hash symlink in the authority directory so that
-    // SSL_CTX_set_verify_path / add_verify_path can resolve the CA.
-    auto ca = NSNAME::loadCertificate(AUTHORITY_CA_CERT_PATH);
-    if (!ca)
-    {
-        LOG_ERROR("Failed to load CA cert for hash link generation");
-        return false;
-    }
-    unsigned long hash = X509_subject_name_hash(ca.get());
-    std::ostringstream oss;
-    oss << std::hex << std::setw(8) << std::setfill('0') << hash;
-    const fs::path authorityDir =
-        fs::path(AUTHORITY_CA_CERT_PATH).parent_path();
-    // Find first free index.
-    int idx = 0;
-    fs::path hashLink;
-    do
-    {
-        hashLink = authorityDir / (oss.str() + "." + std::to_string(idx));
-        idx++;
-    } while (fs::exists(hashLink) && idx < 100);
-
-    if (!fs::exists(hashLink))
-    {
-        fs::create_symlink(fs::path(AUTHORITY_CA_CERT_PATH).filename(),
-                           hashLink, ec);
-        if (ec)
-        {
-            LOG_ERROR("Failed to create hash symlink {}: {}", hashLink.string(),
-                      ec.message());
-            return false;
-        }
-        LOG_INFO("Created trust-store hash symlink {}", hashLink.string());
-    }
-
     return true;
 }
 
