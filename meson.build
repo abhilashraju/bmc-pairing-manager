@@ -61,11 +61,17 @@ configure_file(
     install: true,
     install_dir: dependency('systemd').get_variable('systemdsystemunitdir'),
 )
-if get_option('use_filesystem_strategy')
-    add_project_arguments('-DUSE_FILESYSTEM_STRATEGY', language: 'cpp')
-    message('pic_controller: using FileSystemStrategy for persistence')
+if get_option('use_tpm_certificate')
+    add_project_arguments('-DUSE_TPM_CERTIFICATE', language: 'cpp')
+    message('certificates: using TPM-backed strategy')
 else
+    message('certificates: using filesystem strategy')
+endif
+if get_option('use_pic_controller')
+    add_project_arguments('-DUSE_PIC_CONTROLLER', language: 'cpp')
     message('pic_controller: using I2CStrategy for persistence')
+else
+    message('pic_controller: using FileSystemStrategy for persistence')
 endif
 
 executable(

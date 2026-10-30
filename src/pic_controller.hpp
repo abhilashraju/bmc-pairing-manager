@@ -389,13 +389,13 @@ class I2CStrategy
 /**
  * @brief Compile-time strategy selection
  *
- * Define USE_FILESYSTEM_STRATEGY to use FileSystemStrategy,
- * otherwise I2CStrategy is used by default.
+ * Define USE_PIC_CONTROLLER to use I2CStrategy,
+ * otherwise FileSystemStrategy is used by default.
  */
-#ifdef USE_FILESYSTEM_STRATEGY
-using DefaultPersistenceStrategy = FileSystemStrategy;
-#else
+#ifdef USE_PIC_CONTROLLER
 using DefaultPersistenceStrategy = I2CStrategy;
+#else
+using DefaultPersistenceStrategy = FileSystemStrategy;
 #endif
 
 /**
@@ -495,8 +495,8 @@ class PicControllerImpl
  * selected default strategy (FileSystemStrategy or I2CStrategy).
  *
  * Strategy Selection:
- * - Define USE_FILESYSTEM_STRATEGY to use FileSystemStrategy
- * - Otherwise, I2CStrategy is used (default)
+ * - Define USE_PIC_CONTROLLER to use I2CStrategy
+ * - Otherwise, FileSystemStrategy is used (default)
  */
 class PicController : public PicControllerImpl<DefaultPersistenceStrategy>
 {
