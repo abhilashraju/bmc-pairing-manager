@@ -666,8 +666,7 @@ struct TpmCertStrategy : ICertificateStrategy
 
         const std::string entityName = hostName.empty() ? "bmc" : hostName;
         const std::string serverSubject = std::format("/CN={}", entityName);
-        const std::string clientSubject =
-            std::format("/CN={}-client", entityName);
+        const std::string clientSubject = "/CN=service";
 
         boost::system::error_code ec;
         if (isSimics())
