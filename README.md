@@ -315,13 +315,13 @@ The daemon reads configuration from
 To pair self:
 
 ```bash
-busctl call xyz.openbmc_project.BmcPairingManager /xyz/openbmc_project/BmcPairingManager xyz.openbmc_project.BmcPairingManager.BmcPairingManager ProvisionPeer s self
+busctl call xyz.openbmc_project.BmcPairing /xyz/openbmc_project/Pairing xyz.openbmc_project.BmcPairing.BmcPairing PairPeer s "self"
 ```
 
 To pair a peer (e.g., skiboards):
 
 ```bash
-busctl call xyz.openbmc_project.BmcPairingManager /xyz/openbmc_project/BmcPairingManager xyz.openbmc_project.BmcPairingManager.BmcPairingManager ProvisionPeer s skiboards
+busctl call xyz.openbmc_project.BmcPairing /xyz/openbmc_project/Pairing xyz.openbmc_project.BmcPairing.BmcPairing PairPeer s "peer"
 ```
 
 ### Checking Pairing Status
@@ -329,13 +329,13 @@ busctl call xyz.openbmc_project.BmcPairingManager /xyz/openbmc_project/BmcPairin
 To check if paired:
 
 ```bash
-busctl get-property xyz.openbmc_project.BmcPairingManager /xyz/openbmc_project/BmcPairingManager xyz.openbmc_project.BmcPairingManager.BmcPairingManager provisioned
+busctl get-property xyz.openbmc_project.BmcPairing /xyz/openbmc_project/Pairing xyz.openbmc_project.BmcPairing.BmcPairing Paired
 ```
 
 To check peer connection status:
 
 ```bash
-busctl get-property xyz.openbmc_project.BmcPairingManager /xyz/openbmc_project/BmcPairingManager xyz.openbmc_project.BmcPairingManager.BmcPairingManager peerConnected
+busctl get-property xyz.openbmc_project.BmcPairing /xyz/openbmc_project/Pairing xyz.openbmc_project.BmcPairing.BmcPairing PeerConnected
 ```
 
 ## Error Handling

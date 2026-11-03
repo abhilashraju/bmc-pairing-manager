@@ -67,6 +67,12 @@ if get_option('use_tpm_certificate')
 else
     message('certificates: using filesystem strategy')
 endif
+if get_option('use_spdm_attestation')
+    add_project_arguments('-DUSE_SPDM_ATTESTATION', language: 'cpp')
+    message('attestation: using SPDM strategy')
+else
+    message('attestation: using attestation stub strategy')
+endif
 if get_option('use_pic_controller')
     add_project_arguments('-DUSE_PIC_CONTROLLER', language: 'cpp')
     message('pic_controller: using I2CStrategy for persistence')

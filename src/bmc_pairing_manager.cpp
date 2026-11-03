@@ -1,3 +1,4 @@
+#include "attestation_strategy.hpp"
 #include "bmc_pairing_manager_object.hpp"
 #include "bmcresponder.hpp"
 #include "cert_generator.hpp"
@@ -16,18 +17,9 @@
 
 #include <fstream>
 #include <iostream>
-static constexpr auto ATTESTATION_SVC = "xyz.openbmc_project.attestation";
-static constexpr auto ATTESTATION_DEVICE_PATH =
-    "/xyz/openbmc_project/attestation_requester/devices/tcp/{}";
 static constexpr auto ATTESTATION_RES_PATH =
     "/xyz/openbmc_project/attestation_responder/tcp/{}";
-static constexpr auto ATTESTATION_DEVICE_INTF =
-    "xyz.openbmc_project.AttestationDevice";
-static constexpr auto ATTESTATION_RES_INTF =
-    "xyz.openbmc_project.AttestationResponder";
 static constexpr auto ATTESTATION_PROP = "Status";
-static constexpr auto ATTESTATION_REQ_SIGNAL = "Attested";
-static constexpr auto ATTESTATION_RES_SIGNAL = "Attested";
 static constexpr auto LLDP_PROP = "ManagementAddressIPv4";
 using DbusObjectPath = std::string;
 using DbusInterface = std::string;
@@ -298,23 +290,7 @@ net::awaitable<void> startSpdm(
         // This method would start the SPDM provisioning process.
         // Implementation would depend on the specific requirements.
         LOG_INFO("Starting SPDM pairing");
-        auto device = std::format(ATTESTATION_DEVICE_PATH, deviceName);
-        auto [ec, msg] =
-            co_await awaitable_dbus_method_call<sdbusplus::message_t>(
-                *conn, ATTESTATION_SVC, device, ATTESTATION_DEVICE_INTF,
-                "attest");
-
-        if (ec)
-        {
-            LOG_ERROR("Failed to start spdm: {}", ec.message());
-            co_return;
-        }
-
-        auto watcher = DbusSignalWatcher<bool>::create(
-            conn, ATTESTATION_DEVICE_INTF, ATTESTATION_REQ_SIGNAL);
-        std::optional<bool> val = co_await watcher->watchOnce(30s);
-
-        if (val && *val)
+        if (co_await AttestationStrategy::attest(conn, deviceName))
         {
             LOG_INFO("SPDM pairing completed successfully (requester)");
             co_await controller.get().setPaired(true);
@@ -474,11 +450,10 @@ void setupWatchers(net::io_context& io_context,
                    std::shared_ptr<BmcResponder>& bmcResponder)
 {
     // Attestation state watcher
-    DbusSignalWatcher<bool>::watch(
+    AttestationStrategy::watchAttestationState(
         io_context, conn,
         std::bind_front(onSpdmStateChange, std::ref(io_context), config.port,
-                        std::ref(controller), std::ref(bmcResponder)),
-        ATTESTATION_RES_INTF, ATTESTATION_RES_SIGNAL);
+                        std::ref(controller), std::ref(bmcResponder)));
 
     // Neighbour discovery
     auto neighbourHandler =

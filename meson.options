@@ -36,6 +36,13 @@ option(
 )
 
 option(
+    'use_spdm_attestation',
+    type: 'boolean',
+    description: 'Attest the peer by calling SPDM directly; default uses the attestation stub service',
+    value: false,
+)
+
+option(
     'use_tpm_certificate',
     type: 'boolean',
     description: 'Use TPM-backed certificates and SSL contexts; default uses filesystem PEM files',
