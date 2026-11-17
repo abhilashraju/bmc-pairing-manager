@@ -63,6 +63,10 @@ configure_file(
 )
 if get_option('use_tpm_certificate')
     add_project_arguments('-DUSE_TPM_CERTIFICATE', language: 'cpp')
+    tss2_esys_dep = dependency('tss2-esys', required: true)
+    bmc_pairing_manager_dep = declare_dependency(
+        dependencies: [bmc_pairing_manager_dep, tss2_esys_dep],
+    )
     message('certificates: using TPM-backed strategy')
 else
     message('certificates: using filesystem strategy')

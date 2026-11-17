@@ -1,19 +1,31 @@
 #pragma once
 #include "cert_generator.hpp"
 
+#include <openssl/err.h>
+#include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/x509.h>
+
+#ifdef USE_TPM_CERTIFICATE
+#include <tss2/tss2_esys.h>
+#endif
 
 #include <boost/asio/ssl.hpp>
 #include <boost/system/error_code.hpp>
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <memory>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace NSNAME
 {
@@ -1037,35 +1049,178 @@ class Tpm2CertManager
      * @param outCert Output certificate pointer
      * @return error_code indicating success or failure
      */
+    // Previous implementation: shelled out to tpm2_nvread via a temp file.
+    // static boost::system::error_code readCertificateFromTPMNV(
+    //     const std::string& nvIndex, X509Ptr& outCert)
+    // {
+    //     TempDir td;
+    //     std::string tempFile = td.path("cert.pem");
+    //     // Redirect only stdout to the temp file; send stderr to /dev/null so
+    //     // that tpm2-tools warning/info lines are not mixed into the PEM
+    //     // data.
+    //     std::string cmd = std::format("tpm2_nvread -C o {} > {} 2>/dev/null",
+    //                                   nvIndex, tempFile);
+    //
+    //     // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    //     if (system(cmd.c_str()) != 0)
+    //     {
+    //         LOG_ERROR("Failed to read from TPM NV index {}", nvIndex);
+    //         return boost::system::errc::make_error_code(
+    //             boost::system::errc::io_error);
+    //     }
+    //
+    //     // Load certificate from temp file
+    //     FilePtr fp = makeFilePtr(fopen(tempFile.c_str(), "r"));
+    //     if (!fp)
+    //     {
+    //         LOG_ERROR("Failed to open temp certificate file");
+    //         return boost::system::errc::make_error_code(
+    //             boost::system::errc::io_error);
+    //     }
+    //
+    //     X509* cert = PEM_read_X509(fp.get(), nullptr, nullptr, nullptr);
+    //     fp.reset(); // Close file before parsing
+    //
+    //     if (!cert)
+    //     {
+    //         LOG_ERROR("Failed to parse certificate from NV index {}",
+    //                   nvIndex);
+    //         return boost::system::errc::make_error_code(
+    //             boost::system::errc::invalid_argument);
+    //     }
+    //
+    //     outCert = makeX509Ptr(cert);
+    //     LOG_INFO("Certificate read from TPM NV index {}", nvIndex);
+    //     return boost::system::error_code{};
+    // }
+
+#ifdef USE_TPM_CERTIFICATE
+    /** @brief Deleter for buffers allocated by the TSS ESAPI (Esys_Free) */
+    struct EsysFreeDeleter
+    {
+        void operator()(void* ptr) const
+        {
+            Esys_Free(ptr);
+        }
+    };
+    template <typename T>
+    using EsysPtr = std::unique_ptr<T, EsysFreeDeleter>;
+
+    /** @brief Deleter for ESYS_CONTEXT. Esys_Finalize also releases every
+     *         ESYS_TR handle created on the context. */
+    struct EsysContextDeleter
+    {
+        void operator()(ESYS_CONTEXT* ctx) const
+        {
+            if (ctx != nullptr)
+            {
+                Esys_Finalize(&ctx);
+            }
+        }
+    };
+    using EsysContextPtr = std::unique_ptr<ESYS_CONTEXT, EsysContextDeleter>;
+#endif
+
     static boost::system::error_code readCertificateFromTPMNV(
         const std::string& nvIndex, X509Ptr& outCert)
     {
-        TempDir td;
-        std::string tempFile = td.path("cert.pem");
-        // Redirect only stdout to the temp file; send stderr to /dev/null so
-        // that tpm2-tools warning/info lines are not mixed into the PEM data.
-        std::string cmd = std::format("tpm2_nvread -C o {} > {} 2>/dev/null",
-                                      nvIndex, tempFile);
-
-        // NOLINTNEXTLINE(concurrency-mt-unsafe)
-        if (system(cmd.c_str()) != 0)
+#ifdef USE_TPM_CERTIFICATE
+        // Parse the NV index string (e.g. "0x1500002") into a TPM handle.
+        errno = 0;
+        char* end = nullptr;
+        unsigned long parsed = strtoul(nvIndex.c_str(), &end, 0);
+        if (errno != 0 || end == nvIndex.c_str() || *end != '\0' ||
+            parsed > UINT32_MAX)
         {
-            LOG_ERROR("Failed to read from TPM NV index {}", nvIndex);
+            LOG_ERROR("Invalid TPM NV index {}", nvIndex);
+            return boost::system::errc::make_error_code(
+                boost::system::errc::invalid_argument);
+        }
+        auto nvHandle = static_cast<TPMI_RH_NV_INDEX>(parsed);
+
+        ESYS_CONTEXT* rawCtx = nullptr;
+        if (Esys_Initialize(&rawCtx, nullptr, nullptr) != TSS2_RC_SUCCESS)
+        {
+            LOG_ERROR("Failed to initialize ESAPI context");
+            return boost::system::errc::make_error_code(
+                boost::system::errc::io_error);
+        }
+        EsysContextPtr ctx(rawCtx);
+
+        ESYS_TR nv = ESYS_TR_NONE;
+        if (Esys_TR_FromTPMPublic(ctx.get(), nvHandle, ESYS_TR_NONE,
+                                  ESYS_TR_NONE, ESYS_TR_NONE, &nv) !=
+            TSS2_RC_SUCCESS)
+        {
+            LOG_ERROR("Failed to access TPM NV index {}", nvIndex);
             return boost::system::errc::make_error_code(
                 boost::system::errc::io_error);
         }
 
-        // Load certificate from temp file
-        FilePtr fp = makeFilePtr(fopen(tempFile.c_str(), "r"));
-        if (!fp)
+        TPM2B_NV_PUBLIC* rawPub = nullptr;
+        if (Esys_NV_ReadPublic(ctx.get(), nv, ESYS_TR_NONE, ESYS_TR_NONE,
+                               ESYS_TR_NONE, &rawPub, nullptr) !=
+            TSS2_RC_SUCCESS)
         {
-            LOG_ERROR("Failed to open temp certificate file");
+            LOG_ERROR("Failed to read public area of TPM NV index {}", nvIndex);
+            return boost::system::errc::make_error_code(
+                boost::system::errc::io_error);
+        }
+        EsysPtr<TPM2B_NV_PUBLIC> pub(rawPub);
+
+        constexpr uint16_t maxChunk = 512;
+        const uint16_t total = pub->nvPublic.dataSize;
+        uint16_t off = 0;
+        std::vector<uint8_t> data;
+        data.reserve(total);
+        while (off < total)
+        {
+            uint16_t chunk = std::min<uint16_t>(total - off, maxChunk);
+            TPM2B_MAX_NV_BUFFER* rawBuf = nullptr;
+            // Owner hierarchy auth (equivalent of tpm2_nvread -C o)
+            if (Esys_NV_Read(ctx.get(), ESYS_TR_RH_OWNER, nv, ESYS_TR_PASSWORD,
+                             ESYS_TR_NONE, ESYS_TR_NONE, chunk, off, &rawBuf) !=
+                TSS2_RC_SUCCESS)
+            {
+                LOG_ERROR("Failed to read from TPM NV index {}", nvIndex);
+                return boost::system::errc::make_error_code(
+                    boost::system::errc::io_error);
+            }
+            EsysPtr<TPM2B_MAX_NV_BUFFER> buf(rawBuf);
+            if (buf->size == 0)
+            {
+                LOG_ERROR("Empty read from TPM NV index {}", nvIndex);
+                return boost::system::errc::make_error_code(
+                    boost::system::errc::io_error);
+            }
+            data.insert(data.end(), buf->buffer, buf->buffer + buf->size);
+            off = static_cast<uint16_t>(off + buf->size);
+        }
+
+        if (data.empty())
+        {
+            LOG_ERROR("TPM NV index {} is empty", nvIndex);
             return boost::system::errc::make_error_code(
                 boost::system::errc::io_error);
         }
 
-        X509* cert = PEM_read_X509(fp.get(), nullptr, nullptr, nullptr);
-        fp.reset(); // Close file before parsing
+        // Accept either PEM or DER encoded certificates.
+        BIOPtr bio = makeBIOPtr(
+            BIO_new_mem_buf(data.data(), static_cast<int>(data.size())));
+        if (!bio)
+        {
+            LOG_ERROR("Failed to allocate BIO for NV index {}", nvIndex);
+            return boost::system::errc::make_error_code(
+                boost::system::errc::not_enough_memory);
+        }
+        X509Ptr cert = makeX509Ptr(
+            PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
+        if (!cert)
+        {
+            ERR_clear_error();
+            BIO_reset(bio.get());
+            cert = makeX509Ptr(d2i_X509_bio(bio.get(), nullptr));
+        }
 
         if (!cert)
         {
@@ -1074,9 +1229,15 @@ class Tpm2CertManager
                 boost::system::errc::invalid_argument);
         }
 
-        outCert = makeX509Ptr(cert);
+        outCert = std::move(cert);
         LOG_INFO("Certificate read from TPM NV index {}", nvIndex);
         return boost::system::error_code{};
+#else
+        LOG_ERROR("TPM support not enabled; cannot read NV index {}", nvIndex);
+        (void)outCert;
+        return boost::system::errc::make_error_code(
+            boost::system::errc::not_supported);
+#endif
     }
 
     /**
